@@ -242,24 +242,59 @@ if [[ -r "$LOOP_NOTES" ]]; then
   RESOURCE_NOTE+="$(cat "$LOOP_NOTES")"
 fi
 
+# ── ensure_run_root_excluded ──────────────────────────────────────────────
+# Put $RUN_ROOT in .git/info/exclude, which is per-clone and branch-independent
+# — the only place that holds when the loop checks out a branch whose
+# .gitignore predates the rule. Without it, `git add -A` sweeps every log and
+# every raw model response into the PR, and `git clean -fd` deletes the log of
+# the run you are trying to diagnose. This is the one file outside the run
+# directory the loop writes to on its own initiative; the line is local, and
+# deleting it is enough to undo.
+#
+# Deliberately NOT conditional on `git check-ignore`. A project that also lists
+# the run directory in .gitignore — a reasonable thing to do, so it is
+# discoverable to anyone reading that file — would satisfy that probe and
+# suppress this line. That trade is invisible and backwards: .gitignore is
+# tracked and therefore branch-scoped, and this loop is built to ADOPT branches
+# that predate anything you add today. The ordering hides it further — init_run
+# and preflight_common both run BEFORE the checkout, so both would be evaluated
+# against a branch that is not the one the run goes on to operate on. Keying
+# idempotency on the exclude file's own contents instead makes a .gitignore
+# rule harmless redundancy rather than a silent downgrade.
+#
+# A TRACKED run directory is the one real exemption: ignore rules do not apply
+# to tracked paths, so the line would be noise.
+ensure_run_root_excluded() {
+  git ls-files --error-unmatch "$RUN_ROOT" >/dev/null 2>&1 && return 0
+
+  # --git-path, not "$REPO_ROOT/.git/...": in a worktree or a submodule, .git is
+  # a file pointing elsewhere, and info/exclude lives in the common dir.
+  local excl; excl="$(git rev-parse --git-path info/exclude 2>/dev/null)" || return 0
+  [[ -n "$excl" ]] || return 0
+  mkdir -p "$(dirname "$excl")" 2>/dev/null || return 0
+  [[ -e "$excl" ]] || : >"$excl" 2>/dev/null || return 0
+
+  # -x so a longer path that merely starts with $RUN_ROOT (.loops-archive) and a
+  # commented-out line (# .loops) do not read as already handled; -F so a dot in
+  # the name is a literal dot and not any-character.
+  grep -qxF -- "$RUN_ROOT" "$excl" 2>/dev/null && return 0
+
+  # A last line with no trailing newline would otherwise absorb ours into it,
+  # producing one concatenated rule that matches nothing.
+  [[ -s "$excl" && -n "$(tail -c1 "$excl")" ]] && printf '\n' >>"$excl"
+  printf '%s\n' "$RUN_ROOT" >>"$excl" \
+    && echo "added $RUN_ROOT to $excl (local to this clone)"
+}
+
 # ── init_run <label> ──────────────────────────────────────────────────────
 # Names this run's artifact directory and opens its log. Each entrypoint calls
 # this once; the lib deliberately does not do it at source time, so separate
 # entrypoints get distinct run directories.
 #
-# The run directory is created here, so it is excluded here too — in
-# .git/info/exclude, which is per-clone and branch-independent, and therefore
-# the only place that holds when the loop checks out a feature branch whose
-# .gitignore predates it. Without it, `git add -A` sweeps every log and every
-# raw model response into the PR. This is the one file outside the run
-# directory the loop writes to on its own initiative; the line is local, and
-# deleting it is enough to undo.
+# The exclude line is ensured before the mkdir below, so the run directory never
+# exists while unignored.
 init_run() {
-  if ! git check-ignore -q "$RUN_ROOT" \
-     && ! git ls-files --error-unmatch "$RUN_ROOT" >/dev/null 2>&1; then
-    printf '%s\n' "$RUN_ROOT" >> "$REPO_ROOT/.git/info/exclude"
-    echo "added $RUN_ROOT to .git/info/exclude (local to this clone)"
-  fi
+  ensure_run_root_excluded
   RUN_DIR="$REPO_ROOT/$RUN_ROOT/$(date +%Y%m%d-%H%M%S)${1:+-$1}"
   mkdir -p "$RUN_DIR"
   ln -sfn "$RUN_DIR" "$REPO_ROOT/$RUN_ROOT/latest"
