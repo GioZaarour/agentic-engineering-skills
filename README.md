@@ -29,7 +29,9 @@ They install globally, for every project on the machine. To scope them to one re
 ln -s ~/path/to/agentic-engineering-skills/skills/implement-spec .claude/skills/implement-spec
 ```
 
-Then invoke them by name in a session — `/spec-planning`, `/review-spec`, `/implement-spec`, `/techdebt`, `/pr-review`, `/update-context`, `/document-code`, `/spec-from-issue`. A session that was already open when you installed them won't see them; start a new one.
+Then invoke them by name in a session — `/spec-planning`, `/review-spec`, `/implement-spec`, `/techdebt`, `/pr-review`, `/update-context`, `/document-code`, `/spec-from-issue`, `/clear-technical-writing`. A session that was already open when you installed them won't see them; start a new one.
+
+`/clear-technical-writing` is a shared writing layer for human-facing engineering text. The spec, code-documentation, PR-review, and context-update skills invoke it automatically. You can also invoke it directly for PR descriptions, review comments, repository documentation, and engineering reports.
 
 ## Assumed Conventions
 
@@ -85,7 +87,7 @@ The `spec-review` stage does not call `/review-spec`. That skill is an interview
 
 #### Setup
 
-1. Install the skills — `./install.sh`, as above. The loop calls `/spec-from-issue`, `/implement-spec`, `/techdebt`, `/pr-review` and `/update-context`; preflight looks for each one and warns (it does not block) if it cannot find it, so a missing skill shows up in the first ten seconds instead of an hour into a run.
+1. Install the skills — `./install.sh`, as above. The loop calls `/spec-from-issue`, `/implement-spec`, `/techdebt`, `/pr-review`, and `/update-context`. Those skills and the inline PR-writing stages use `/clear-technical-writing` for human-facing text. Preflight checks for all six skills and warns (it does not block) if it cannot find one, so a missing skill shows up in the first ten seconds instead of an hour into a run.
 2. Copy `scripts/issue-loop.sh` and `scripts/loops-lib.sh` into your own repo, under `scripts/`. They must sit next to each other. Committing them to your repo is the simplest thing to do; if you would rather keep them untracked, add both paths to `.git/info/exclude` — **not** `.gitignore`. `.gitignore` is tracked and therefore branch-scoped, so a rule you add on `main` does not exist on the feature branch the loop is about to `git add -A` on. Preflight refuses to start unless one of the two is true.
 3. On your PATH: `claude`, `gh`, `jq`, `git`, and bash **4.2 or newer**. macOS ships bash 3.2 as `/bin/bash` — `brew install bash` and make sure it comes first, or the scripts will die on a syntax error. macOS also has no `timeout`; `brew install coreutils` gives you `gtimeout`, which the scripts find on their own. Without it a wedged stage hangs forever instead of being killed at `STAGE_TIMEOUT`.
 4. `gh auth login`, once, on the machine that will run the loop.
@@ -157,7 +159,7 @@ Killing it mid-stage leaves the tree mid-edit. That is safe to resume from (belo
 
 #### When it stops
 
-The exit code is load-bearing:
+The exit code determines how you resume the run:
 
 | Exit | Meaning | What to do |
 |---|---|---|

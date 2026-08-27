@@ -17,9 +17,9 @@ Every slice — including a single-slice spec — runs this loop before its comm
 
 1. **Write the failing tests** from the slice's acceptance criteria. TDD is mandatory wherever the code is unit-testable (Rust logic, pure functions, FFI contracts): red first, then green. For code where a failing-first unit test is impractical (e.g. DSP/audio/realtime), pin the contract with a characterization or integration test instead (rendered-output assertions, buffer invariants, golden files) — the slice is not done until *some* automated test covers it. Never skip a test because it's hard, and never weaken an existing test to pass.
 2. **Implement** the slice to make the tests pass. Keep the diff scoped to this slice.
-3. **Document** the slice's new and changed code inline using the `document-code` skill — you understand the machine best, so you write the comments.
+3. **Document** the slice's new and changed code inline using `/document-code`. That skill invokes `/clear-technical-writing`, so the comments define internal terms and explain the code for an engineer who is new to the codebase.
 4. **Clean techdebt** with a fresh, un-primed subagent. Spawn a subagent scoped to *only this slice's uncommitted changes* (`git diff HEAD` plus untracked files — explicitly not the whole branch against main), and have it run the `techdebt` skill on that diff, apply fixes to the working tree, and **not** commit (you own the single slice commit in step 5). It's un-primed on purpose — it catches cruft the author is blind to. Apply its fixes.
-5. **Commit.** Gate: the slice's new tests and the tests in the areas it touched must be green (full-suite regression is checked once at the end of the run, not per slice). Write a focused commit whose message starts with `feat:`, `bugfix:`, `chore:`, `docs:`, or `tests:`. Then check the slice off in the spec's Slices section. **Do not push** — the user pushes.
+5. **Commit.** Requirement: the slice's new tests and the tests in the areas it touched must be green (full-suite regression is checked once at the end of the run, not per slice). Write a focused commit whose message starts with `feat:`, `bugfix:`, `chore:`, `docs:`, or `tests:`. Then check the slice off in the spec's Slices section. **Do not push** — the user pushes.
 
 ## Parallelism
 
@@ -29,4 +29,4 @@ Read the slice dependency graph as a wavefront. Whenever two or more slices have
 
 A **slice** is done when its tests are green, the code is documented, techdebt is clean, and a focused commit has landed.
 
-The **spec** is done when every slice is checked off and the **full test suite passes** on the merged tree. Report what's built; leave pushing to the user.
+The **spec** is done when every slice is checked off and the **full test suite passes** on the merged tree. Before you report what was built, invoke `/clear-technical-writing` and apply it to the report. Leave pushing to the user.

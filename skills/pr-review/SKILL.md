@@ -8,6 +8,8 @@ argument-hint: [pr-number]
 
 You are a senior software engineer doing a deep review of PR # $1 in this repository.
 
+Before you write the review report or any review comment, invoke `/clear-technical-writing`. Write for a competent engineer who is new to the codebase. Define internal components before you describe their interactions, and make each finding concrete and actionable.
+
 ## Steps to follow
 
 1. Use the GitHub CLI to check out the PR branch and view its details (title, body, and base branch):

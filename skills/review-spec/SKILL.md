@@ -7,13 +7,15 @@ argument-hint: [spec-file-path]
 
 Review this plan/spec thoroughly before making any changes. 
 
+Before you write review feedback or edit the spec, invoke `/clear-technical-writing`. Apply it to the interview text, recommendations, and spec changes. Define project-specific components before you compare their boundaries or data flow.
+
 First, study the codebase in areas relevant to the spec’s scope, if any. start with AGENTS.md as an entry point if available, which should point it to the right places in the code to look. Otherwise, explore the codebase. This is to make sure you make no implicit assumptions or incorrect framings before interviewing me to plan the spec. You should not be bringing up spec improvements for things that may already be implemented or redundant based on a scan of the codebase.
 
 ## Respect the implementation contract
 
 This spec is going to be built by the `/implement-spec` command, which reads it in a specific shape. Review and scrutinize freely — that's the job — but stay conscious of that downstream contract as you edit:
 
-- **Don't delete the structural sections; sharpen them.** The spec might have a **Slices** section (slices at API/module boundaries, each one reviewable commit, each with acceptance criteria / test intent and its dependencies on other slices, each with a checkbox), an **Open questions** section, and the captured design decisions/taste are load-bearing. You may re-slice, re-order, tighten, or rewrite them — but don't strip them out or leave them malformed.
+- **Don't delete the structural sections; sharpen them.** The spec might have a **Slices** section (slices at API/module boundaries, each one reviewable commit, each with acceptance criteria / test intent and its dependencies on other slices, each with a checkbox), an **Open questions** section, and essential captured design decisions. You may re-slice, re-order, tighten, or rewrite them — but don't strip them out or leave them malformed.
 - **Route findings into those structures instead of orphaning them.** A missing edge case → add it to the relevant slice's acceptance criteria / test intent (state what the test must prove, not test code). A risk that needs my decision → an Open question with what unblocks it. A coupling or boundary problem → fix the slice boundaries and their dependency graph. A DRY/test-coverage concern → the affected slice's criteria.
 - **Respect the small-spec case.** If the spec has no Slices section it's a single-slice spec by design — don't manufacture slices onto work that's really one commit. Only introduce slicing if the work is genuinely large enough to warrant it, and say why.
 
@@ -40,7 +42,7 @@ Evaluate:
 - Code organization and module structure.  
 - DRY violations—be aggressive here.  
 - Error handling patterns and missing edge cases (call these out explicitly).
-- Make sure tracing and error handling are robust, especially for newly added features. Utilize the existing tracing/logging/error handling code if it’s already in the codebase
+- Make sure tracing and error handling are robust, especially for newly added features. Use the existing tracing, logging, and error-handling code if it is already in the codebase.
 - Technical debt hotspots.  
 - Areas that are over-engineered or under-engineered relative to my preferences.  
 

@@ -4,6 +4,8 @@ description: Add documenting comments to code so a future engineer understands w
 
 # /document-code
 
+Before you write or revise comments, invoke `/clear-technical-writing`. Apply it to every comment and docstring you add. Preserve exact code identifiers, but define internal terms for a competent engineer who is new to the codebase.
+
 Write documenting comments that tell what each piece does **in the machine**. Add a file summary at the top of each file, and comments on structs, objects, conditionals, functions, traits, and the like.
 
 Put comments where an engineer would stop and ask *"what does this code do, exactly?"* — an engineer can read the code, but when it sits on many layers of abstraction they often can't tell what its **function** is. So don't narrate what a line does in its specifics; state what the function of the part is.

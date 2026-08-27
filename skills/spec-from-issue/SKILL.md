@@ -11,7 +11,7 @@ This is the unattended sibling of `/spec-planning`. The reasoning is identical; 
 
 - **CODE** — the codebase answers it. Go read it. Always prefer this.
 - **PRECEDENT** — a decision the user already made answers it: the parent spec this issue descends from, sibling specs under `./specs/`, `AGENTS.md`, or an unwritten convention the code consistently enforces. This is the replacement for the interview. The user's taste is not gone; it is recorded in what they already built and already specced. Go find it.
-- **DERIVED** — neither covers it, but the decision is low blast radius and cheap to reverse. Decide it yourself, and log it.
+- **DERIVED** — neither covers it, but the decision affects few components and is cheap to reverse. Decide it yourself, and log it.
 - **BLOCKED** — neither covers it, and the decision is expensive or product-facing. Stop. See *The blocking bar*.
 
 ## Operating mode — non-negotiable
@@ -37,9 +37,9 @@ If the issue's stated diagnosis conflicts with what the code shows — the issue
 
 ## Step 2 — Known unknowns
 
-Enumerate the questions `/spec-planning` would have asked, ordered by architectural blast radius, highest first. Then close every one. For each, record which of CODE / PRECEDENT / DERIVED / BLOCKED closed it and what the evidence was.
+Enumerate the questions `/spec-planning` would have asked. Start with the decision that affects the most components or public behavior. Then close every question. For each, record which of CODE / PRECEDENT / DERIVED / BLOCKED closed it and what the evidence was.
 
-Do not skip the enumeration because you can't ask anyone. Naming the question is what surfaces the blast radius; a question you never wrote down is a decision you made without noticing. But keep them real: never enumerate a question the code answers trivially, and never enumerate one a competent engineer would simply decide.
+Do not skip the enumeration because you can't ask anyone. Naming the question shows who and what the decision affects. A question you never wrote down is a decision you made without noticing. But keep them real: never enumerate a question the code answers trivially, and never enumerate one a competent engineer would simply decide.
 
 ## Step 3 — Unknown knowns: precedent instead of interview
 
@@ -56,11 +56,11 @@ For each taste-bearing decision in this spec, cite where the precedent came from
 
 ## Step 4 — Unknown unknowns
 
-Unchanged from `/spec-planning` — this quadrant never needed a human. Sweep the files the task will touch, state what you covered, and report each landmine as a card: evidence with `file:line`, why it bites, what it changes about the task.
+Unchanged from `/spec-planning` — this quadrant never needed a human. Sweep the files the task will touch, state what you covered, and report each hidden risk with `file:line` evidence, its effect, and the required spec change.
 
-Look specifically for: wrong-by-default data, unwritten conventions, and half-built or reverted prior attempts at this same job. A previous attempt that died is the highest-value find on this list, and the reason it died is usually the landmine.
+Look specifically for wrong-by-default data, unwritten conventions, and incomplete or reverted prior attempts at this work. A prior attempt can show which constraint stopped the work.
 
-A landmine that only needs awareness goes into the spec as a sharp edge. One that forces a decision closes like a Step 2 question — including, if it qualifies, as a BLOCK.
+A risk that only needs awareness goes into the spec under **Risks and constraints**. A risk that forces a decision closes like a Step 2 question, including as a BLOCK when it meets the blocking criteria.
 
 ## The blocking bar
 
@@ -86,12 +86,12 @@ The spec must contain, in this order:
 - **Scope** — what this issue covers, and an explicit line on what it does not.
 - **Known knowns** — settled ground with citations, per Step 1.
 - **Implementation** — the actual spec. Architecture, interfaces, data flow, UX where relevant, edge cases, and the taste decisions carried forward from precedent with their citations.
-- **Sharp edges** — the landmine cards from Step 4.
+- **Risks and constraints** — the evidence, effect, and required spec change from Step 4.
 - **Derived decisions** — every DERIVED close from Steps 2 and 3, as a table: the question, the answer you chose, why, and how to reverse it. This is the section the human reads first when reviewing the PR, so write it for that reader. It is the audit trail that replaces the interview; if it is thin, you did not enumerate honestly.
 - **Deferred** — everything in scope-adjacent territory you found and deliberately did not do, one line each, phrased so it can be filed as a follow-up issue verbatim.
 - **Slices** — per `/spec-planning`: break at API/module boundaries, each one reviewable commit, each with acceptance criteria stated as *what the tests must prove* (not test code) and its dependencies on other slices so the implementer can parallelize independent ones. Checkbox per slice.
 
-`/implement-spec` builds test-first, so the acceptance criteria are load-bearing: they become the tests before any implementation exists. State the contract and the edge cases precisely enough that a test can fail on them. **For a bugfix, one acceptance criterion is always a regression test that fails against current `main` and passes after the fix** — say what it asserts.
+`/implement-spec` builds test-first, so the acceptance criteria are essential: they become the tests before any implementation exists. State the contract and the edge cases precisely enough that a test can fail on them. **For a bugfix, one acceptance criterion is always a regression test that fails against current `main` and passes after the fix** — say what it asserts.
 
 Do not invent slices for work that is really one commit. If the issue is small, skip the Slices section and let the implementer treat it as a single slice. Most follow-up issues are one or two slices; a five-slice spec for a bug fix means you expanded scope somewhere — go back and find it.
 

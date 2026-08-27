@@ -9,6 +9,8 @@ allowed-tools: Bash(gh pr checkout:*), Bash(gh diff:*), Bash(gh pr view:*), Bash
 
 You are tasked with updating the `AGENTS.md` file in the root of the codebase. This file serves as the primary source of truth for high-level context, architecture, and structural knowledge for AI agents working on this project.
 
+Before you edit `AGENTS.md` or `README.md`, invoke `/clear-technical-writing`. Apply it to every addition or revision. Write for a competent engineer who is new to the codebase, and introduce each internal component before you describe how components interact.
+
 ## Step 1: Gather Information
 
 1. **Fetch PR Details**:
@@ -48,7 +50,7 @@ Your goal is to capture **implicit, high-level, and structural** knowledge that 
 - **End-to-End Flows**: How new features connect across the stack (e.g., "The new billing flow uses a Stripe webhook to update the `credits` table via `BillingService`").
 - **Product Context**: High-level explanations of what the product does, new user-facing features, and how they fit into the platform.
 - **New Utilities & Helpers**: Shared libraries or patterns that establish *how* code should be written (e.g., "Added a `verify_signature` middleware for all webhooks").
-- **Structural Relationships**: How different modules, services, and folders glue together to form a cohesive system.
+- **Structural Relationships**: How different modules, services, and folders connect.
 
 ### ❌ DO NOT Include:
 - **Function-Level Details**: Do not describe what specific functions do (e.g., "The function `x` takes `y` and returns `z`"). The AI can read the code.
@@ -71,9 +73,8 @@ Keep it high-level in the README.md and don't go into nitty gritty details about
    - **Add** new sections for entirely new domains or features.
    - **Update** existing sections (e.g., "Project overview", "Services and integrations", "Infrastructure") with new details.
    - **Remove** or mark as deprecated any outdated information.
-   - **Refine** descriptions to glue new parts into the existing system.
+   - **Refine** descriptions to explain how new parts connect to the existing system.
    - **Maintain** the existing markdown formatting and style.
 4. **Read `README.md` and update if necessary**
 
 **Final Output**: A modified `AGENTS.md` file that acts as a high-level "brain" for the codebase, helping future agents understand *why* and *how* the system works as a whole. An up-to-date README.md.
-

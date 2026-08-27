@@ -74,6 +74,8 @@ This is the #1 problem after agent sessions. Look for:
 
 ## Output
 
+Before you write the final cleanup report, invoke `/clear-technical-writing` and apply it to the report.
+
 When done, provide a summary:
 - What you found and fixed (grouped by category)
 - What you intentionally left alone and why

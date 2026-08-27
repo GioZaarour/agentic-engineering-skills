@@ -480,7 +480,7 @@ preflight_common() {
   # these usually are), and under `set -o pipefail` that reports failure even
   # though grep matched — a false warning every time, which hides the real one.
   local cmd d found
-  for cmd in spec-from-issue implement-spec techdebt pr-review update-context; do
+  for cmd in spec-from-issue implement-spec techdebt pr-review update-context clear-technical-writing; do
     found=0
     for d in .claude/commands "$HOME/.claude/commands"; do
       [[ -f "$d/${cmd}.md" ]] && { found=1; break; }
@@ -508,6 +508,8 @@ preflight_common() {
 review_prompt() {
   cat <<EOF
 /pr-review ${1}
+
+/clear-technical-writing
 
 Review in full, in prose, exactly as you normally would. Do not compress your
 findings into a list for a machine.
@@ -615,6 +617,8 @@ run_update_context() {
   local issue="$1" prnum="$2" dir="$3"
   stage "update-context" "$CODE_MODEL" "$HIGH" "$(cat <<EOF
 /update-context ${prnum}
+
+/clear-technical-writing
 
 ${RESOURCE_NOTE}
 EOF

@@ -543,7 +543,7 @@ it outranks sibling specs and it outranks convention. Where it states a
 decision, that decision is the user's and is not yours to re-open — carry every
 one of them forward, in its own words wherever those words are already the
 clearest statement of intent. If the code proves one of them impossible, say so
-under Sharp edges and, if it clears the skill's blocking bar, BLOCK. Do not
+under Risks and constraints and, if it clears the skill's blocking bar, BLOCK. Do not
 quietly substitute your own answer for one the user already gave.
 
 Where the file is silent the skill applies unchanged: close the question from
@@ -551,7 +551,8 @@ CODE, PRECEDENT, or DERIVED, and log every DERIVED close.
 
 Rewrite the file in place. What is in it now is INPUT, not output. When you are
 done, ${SPEC} must satisfy the skill's output contract in full — Scope, Known
-knowns, Implementation, Sharp edges, Derived decisions, Deferred, Slices. If
+knowns, Implementation, Risks and constraints, Derived decisions, Deferred,
+Slices. If
 what is there is only a restatement of the issue, then none of those sections
 exist yet and all of them are your job.
 
@@ -585,6 +586,7 @@ if want spec-review && (( SPEC_REVIEW_ROUNDS > 0 )); then
   [[ -s "$SPEC" ]] || bail spec-review "no spec at $SPEC to review (run the spec stage first)"
   for r in $(seq 1 "$SPEC_REVIEW_ROUNDS"); do
     stage "spec-review r$r" "$PLAN_MODEL" "$XHIGH" "$(cat <<EOF
+
 Read the spec at ${SPEC}. Then re-read the issue it implements:
   gh issue view ${ISSUE} --json title,body,comments
 
@@ -601,13 +603,13 @@ expensive to reverse; two readings that produce different acceptance tests),
 you BLOCK.
 
 Judge it on:
-- **Boundaries** — component seams, coupling, anything that makes a slice
-  un-reviewable on its own.
+- **Boundaries** — component boundaries, coupling, and anything that prevents a
+  reviewer from evaluating a slice on its own.
 - **DRY** — flag repetition aggressively, including repetition with code that
   already exists in the repo but the spec does not mention.
 - **Error handling and tracing** — every new failure path, and whether it uses
   the logging and error types the codebase already has rather than new ones.
-- **Test intent** — this is the load-bearing one. /implement-spec turns each
+- **Test intent** — this is essential. /implement-spec turns each
   slice's acceptance criteria into failing tests BEFORE any code exists. For
   each criterion ask: could a test be written from this sentence, and would it
   fail if the behaviour were wrong? If not, rewrite it until it would.
@@ -622,7 +624,8 @@ Judge it on:
 
 Route every finding into the structure /implement-spec reads, do not orphan it
 in prose, and do not delete or malform the contract sections (Scope, Known
-knowns, Implementation, Sharp edges, Derived decisions, Deferred, Slices).
+knowns, Implementation, Risks and constraints, Derived decisions, Deferred,
+Slices).
 
 Apply your edits to ${SPEC} yourself, surgically. Do not rewrite sections you
 have no finding about. If your honest conclusion is that the spec is already
@@ -681,6 +684,8 @@ if want pr; then
   git push -u origin "$BRANCH" >>"$LOG" 2>&1 || bail pr "push failed"
 
   stage "pr-body" "$CODE_MODEL" "$HIGH" "$(cat <<EOF
+/clear-technical-writing
+
 Write a pull request description for branch ${BRANCH} against ${BASE_BRANCH},
 implementing issue #${ISSUE}, spec at ${SPEC}. Base it on the actual diff
 (git diff origin/${BASE_BRANCH}...${BRANCH}) and on the spec.
