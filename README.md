@@ -1,4 +1,4 @@
-# GioZaarour Agent Skills & Loops 
+# Agent Skills & Loops
 
 This repository contains a set of agent skills I use to engineer software with AI coding tools like Claude Code and Codex. They can be installed and used with any agentic harness that supports the agentskills.io standard.
 
@@ -29,9 +29,9 @@ They install globally, for every project on the machine. To scope them to one re
 ln -s ~/path/to/agentic-engineering-skills/skills/implement-spec .claude/skills/implement-spec
 ```
 
-Then invoke them by name in a session — `/spec-planning`, `/review-spec`, `/implement-spec`, `/techdebt`, `/pr-review`, `/update-context`, `/document-code`, `/spec-from-issue`, `/clear-technical-writing`. A session that was already open when you installed them won't see them; start a new one.
+Then invoke them by name in a session — `/spec-planning`, `/review-spec`, `/implement-spec`, `/techdebt`, `/branch-review`, `/pr-review`, `/update-context`, `/document-code`, `/spec-from-issue`, `/clear-technical-writing`. A session that was already open when you installed them won't see them; start a new one.
 
-`/clear-technical-writing` is a shared writing layer for human-facing engineering text. The spec, code-documentation, PR-review, and context-update skills invoke it automatically. You can also invoke it directly for PR descriptions, review comments, repository documentation, and engineering reports.
+`/clear-technical-writing` is a shared writing layer for human-facing engineering text. The spec, code-documentation, branch-review, PR-review, and context-update skills invoke it automatically. You can also invoke it directly for PR descriptions, review comments, repository documentation, and engineering reports.
 
 ## Assumed Conventions
 
@@ -59,16 +59,18 @@ First, start off by describing your task/issue to the maximum degree of detail a
 - Do the test-driven development (`/implement-spec` with a strong coding model like `Opus 5 xhigh`. You can also use a weaker model for simpler coding features. )
 - QA/testing: Manually test feature and run tests. Iterate on any bugs, if need be.
 - Run `/techdebt` to clean up code in the current branch diff from `main` (separate session, Opus or Sonnet-grade model)
-- Make a PR (generate description from main implementation session, or write it yourself)
-- Run `/pr-review` (separate session, with strong model) then iterate on requested changes if needed
+- Run `/branch-review` (separate session, with strong model) then iterate on requested changes if needed
 - `/update-context` to keep `AGENTS.md` and `README.md` up-to-date (in the main session, with cheaper model)
+- Make a PR — generate the description from the main implementation session and use `/clear-technical-writing`, or write it yourself
+
+`/pr-review` remains available for one-off reviews of existing pull requests, including pull requests opened by other contributors.
 
 ### Loop Engineering path
 
 `scripts/issue-loop.sh` takes **one** GitHub issue from "open" to "PR under review", unattended. It is the same path as above with the human taken out: every step is a skill you can run by hand, and the script's only job is to run them in order, in separate processes, and to stop in a recoverable way when something needs you.
 
 ```
-preflight → resolve → sync → spec → spec-review → implement → techdebt → pr → review ⇄ fix → context
+preflight → resolve → sync → spec → spec-review → implement → techdebt → review ⇄ fix → context → pr
 ```
 
 Each stage is its own `claude -p` process with a clean context window. State moves between them through git and files on disk, never through a shared context — so a stage that goes wrong is bounded, and any stage can be re-run on its own.
@@ -79,15 +81,17 @@ Each stage is its own `claude -p` process with a clean context window. State mov
 | `spec-review` | a non-interactive critique of the spec against the actual code | `PLAN_MODEL` (xhigh) |
 | `implement` | `/implement-spec` — test-first, slice by slice | `CODE_MODEL` (xhigh) |
 | `techdebt` | `/techdebt` over the whole branch diff | `CODE_MODEL` (high) |
-| `pr` | pushes, writes a PR description from the diff and the spec, opens the PR | `CODE_MODEL` (high) |
-| `review` | `/pr-review` ⇄ fix, up to `MAX_REVIEW_ROUNDS`, ending on a review so the count is honest | `PLAN_MODEL` / `CODE_MODEL` |
-| `context` | `/update-context` against the PR | `CODE_MODEL` (high) |
+| `review` | `/branch-review` ⇄ fix against the local branch, up to `MAX_REVIEW_ROUNDS`, ending on a review so the count is honest | `PLAN_MODEL` / `CODE_MODEL` |
+| `context` | `/update-context` against the local branch diff | `CODE_MODEL` (high) |
+| `pr` | pushes the finished branch, writes a PR description from the final diff and the spec, and opens the PR | `CODE_MODEL` (high) |
+
+The default loop does not open a pull request until the branch review is clean and the context update succeeds. If either step needs a human, the loop can push the branch for recovery, but it stops before creating the pull request.
 
 The `spec-review` stage does not call `/review-spec`. That skill is an interview — it stops and asks you things — and under `claude -p` an interview is not a slow run, it is a dead one. The critique is inlined in the script with the questions removed and the standards kept.
 
 #### Setup
 
-1. Install the skills — `./install.sh`, as above. The loop calls `/spec-from-issue`, `/implement-spec`, `/techdebt`, `/pr-review`, and `/update-context`. Those skills and the inline PR-writing stages use `/clear-technical-writing` for human-facing text. Preflight checks for all six skills and warns (it does not block) if it cannot find one, so a missing skill shows up in the first ten seconds instead of an hour into a run.
+1. Install the skills — `./install.sh`, as above. The loop calls `/spec-from-issue`, `/implement-spec`, `/techdebt`, `/branch-review`, and `/update-context`. Those skills and the inline PR-writing stages use `/clear-technical-writing` for human-facing text. Preflight checks for all six skills and warns (it does not block) if it cannot find one, so a missing skill shows up in the first ten seconds instead of an hour into a run.
 2. Copy `scripts/issue-loop.sh` and `scripts/loops-lib.sh` into your own repo, under `scripts/`. They must sit next to each other. Committing them to your repo is the simplest thing to do; if you would rather keep them untracked, add both paths to `.git/info/exclude` — **not** `.gitignore`. `.gitignore` is tracked and therefore branch-scoped, so a rule you add on `main` does not exist on the feature branch the loop is about to `git add -A` on. Preflight refuses to start unless one of the two is true.
 3. On your PATH: `claude`, `gh`, `jq`, `git`, and bash **4.2 or newer**. macOS ships bash 3.2 as `/bin/bash` — `brew install bash` and make sure it comes first, or the scripts will die on a syntax error. macOS also has no `timeout`; `brew install coreutils` gives you `gtimeout`, which the scripts find on their own. Without it a wedged stage hangs forever instead of being killed at `STAGE_TIMEOUT`.
 4. `gh auth login`, once, on the machine that will run the loop.
@@ -134,12 +138,12 @@ tail -f .loops/latest/run.log
 | `spec-review-1.json` / `.md` | spec critique round 1 |
 | `impl.json` | the implement stage |
 | `debt.json` | the techdebt stage |
-| `pr.md` | PR title (line 1) + body |
 | `review-1.md`, `fix-1.json` | review round 1 and the fix that answered it |
 | `review-verify.md` | the final verification review, when one ran |
 | `ctx.json` | the `update-context` stage |
+| `pr.md` | PR title (line 1) + body |
 
-The `.json` files are raw `claude -p --output-format json` results — `.result`, `.total_cost_usd`, `.session_id`. The `.md` files are the readable text, pre-extracted for the spec reviews and PR reviews.
+The `.json` files are raw `claude -p --output-format json` results — `.result`, `.total_cost_usd`, `.session_id`. The `.md` files are the readable text, pre-extracted for the spec reviews and branch reviews.
 
 Cost so far, at any time, without waiting for the run to finish:
 
@@ -163,7 +167,7 @@ The exit code determines how you resume the run:
 
 | Exit | Meaning | What to do |
 |---|---|---|
-| `0` | Done; the review came back clean — or no review stage was selected, in which case the summary says so in as many words | Read the PR, starting with the "Decided without human input" section |
+| `0` | Done; the review came back clean — or no review stage was selected, in which case the summary says so in as many words | Read the PR if one was opened, starting with the "Decided without human input" section |
 | `2` | Preflight or usage error; nothing was touched | Fix what it reported and run again |
 | `3` | Needs a human: the spec `BLOCKED`, or findings survived the fix rounds (or the review never returned a verdict) | Read the file it names — `.loops/latest/<N>/review-verify.md`, or the spec's `## BLOCKED` section — resolve it, then resume |
 | `4` | Hit an account spend/usage limit mid-run | The branch is pushed and safe to leave; resume once the limit resets |
@@ -175,9 +179,9 @@ Every stop prints a summary block with the resume command already filled in, e.g
 ./scripts/issue-loop.sh 19 --from implement
 ```
 
-`--from <stage>` re-runs that stage and everything after it, reusing whatever branch and spec already exist instead of starting over. Stages: `spec`, `spec-review`, `implement`, `techdebt`, `pr`, `review`, `context`.
+`--from <stage>` re-runs that stage and everything after it, reusing whatever branch and spec already exist instead of starting over. Stages: `spec`, `spec-review`, `implement`, `techdebt`, `review`, `context`, `pr`.
 
-Whenever it stops in a way that needs you — a blocked spec, a failed stage, an exhausted account — the issue is labelled `needs-human`, and so is the PR when the review left findings behind. A clean review clears it again. Both that label and the `techdebt` label are created in your repo on the first run if they don't exist, because `gh --add-label` on a missing label is a silent no-op, and a silent no-op here is exactly the signal you'd be looking for.
+Whenever it stops in a way that needs you — a blocked spec, a failed stage, an exhausted account, or unresolved review findings — the issue is labelled `needs-human`. A clean branch review clears it again. Both that label and the `techdebt` label are created in your repo on the first run if they don't exist, because `gh --add-label` on a missing label is a silent no-op, and a silent no-op here is exactly the signal you'd be looking for.
 
 #### Flags worth knowing
 
@@ -188,7 +192,7 @@ Whenever it stops in a way that needs you — a blocked spec, a failed stage, an
 | `--stages a,b,c` / `--skip a,b` | Run exactly these / drop these |
 | `--fresh-spec` | Re-derive the spec instead of iterating on the existing one |
 | `--spec-rounds N` | Spec critique passes after derivation (default 1, `0` = off) |
-| `--no-push` | Never push, never open a PR (implies skipping `pr`, `review`, `context`) — a local-only run of spec + implement |
+| `--no-push` | Never push and never open a PR (implies skipping only `pr`); review and context updates still run locally |
 | `--type <t>` / `--version <v>` / `--branch <name>` / `--spec <path>` / `--base <branch>` | Override the inference when it guesses wrong — check the `--dry-run` output first |
 | `--merge-base` | Merge `origin/<base>` into the branch if it has fallen behind |
 | `--no-adopt` | Skip the off-convention matcher; if the naming convention was not followed, just create the conventional branch and spec |
@@ -199,7 +203,7 @@ Everything is an environment variable with a sane default; there is no config fi
 
 | Variable | Default | What it does |
 |---|---|---|
-| `PLAN_MODEL` | `claude-opus-5` | Spec derivation, spec review, PR review |
+| `PLAN_MODEL` | `claude-opus-5` | Spec derivation, spec review, branch review |
 | `CODE_MODEL` | `claude-sonnet-5` | Implementation, techdebt, fixes, context |
 | `BASE_BRANCH` | `main` | What the PR targets, and what new branches are cut from. Set it to an unmerged branch to stack work on top of it. |
 | `VERSION_SEGMENT` | `v0` | The first path segment in branch and spec names |

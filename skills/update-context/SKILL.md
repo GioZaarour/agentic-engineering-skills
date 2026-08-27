@@ -1,11 +1,11 @@
 ---
-description: Update AGENTS.md with high-level context from recent changes in PR \#$1 (includes linked issues and diff analysis).
-argument-hint: [pr-number]
-globs: AGENTS.md
-allowed-tools: Bash(gh pr checkout:*), Bash(gh diff:*), Bash(gh pr view:*), Bash(gh issue view:*)  
+description: Update AGENTS.md and README.md with high-level context from the current branch, its linked issue, and its diff against the base branch.
+argument-hint: [base-branch]
+globs: AGENTS.md, README.md
+allowed-tools: Read, Edit, Write, Glob, Grep, Bash(git status:*), Bash(git branch:*), Bash(git rev-parse:*), Bash(git merge-base:*), Bash(git log:*), Bash(git diff:*), Bash(git show:*), Bash(gh issue view:*)
 ---
 
-# Update Context from PR #$1
+# Update Context from the Current Branch
 
 You are tasked with updating the `AGENTS.md` file in the root of the codebase. This file serves as the primary source of truth for high-level context, architecture, and structural knowledge for AI agents working on this project.
 
@@ -13,31 +13,32 @@ Before you edit `AGENTS.md` or `README.md`, invoke `/clear-technical-writing`. A
 
 ## Step 1: Gather Information
 
-1. **Fetch PR Details**:
-   Use the GitHub CLI to check out the PR branch and view its details (title, body, and base branch).
+1. **Resolve the Branch Diff**:
+   Stay on the current branch. Resolve the **base branch** from argument `$1` if given, otherwise use `main`. Find the fork point, commit list, and merge-base diff:
    ```bash
-   gh pr checkout $1
-   # Get PR details specifically looking for the base branch name
-   gh pr view $1 --json title,body,baseRefName,url
+   git merge-base origin/<base> HEAD
+   git log --oneline origin/<base>..HEAD
+   git diff origin/<base>...HEAD
    ```
+   Also inspect `git status` and `git diff HEAD` so recent uncommitted edits are not missed. Do not fetch, push, check out another branch, or open a pull request.
 
-2. **Fetch Diff**:
-   Identify the **base branch** from the previous step (e.g., `dev` or `main`). Use `git diff` to find changes relative to that base branch.
-   ```bash
-   # Example if base branch is 'dev'
-   git diff origin/dev...HEAD
-   ```
-
-3. **Identify Linked Issues**:
-   - Parse the PR description (from step 1) for linked issues (e.g., "Fixes #123", "Closes #456", or just mentions of #123).
+2. **Identify Linked Issues**:
+   - Parse the current branch name for an issue number. The convention is `[version]/[type]/[issue]-[slug]`, for example `v0/feature/22-plugin-hosting` links to issue #22.
+   - If necessary, infer the issue from a spec file added or changed on the branch. Specs conventionally use `specs/[version]/[type]/[issue]-[slug].md`.
    - If an issue number is found, fetch its description:
      ```bash
      gh issue view <issue-number>
      ```
+   - If no issue is linked, rely on the spec, commits, and diff for context.
+
+3. **Read the Implementation Spec**:
+   - Find the spec under `./specs` that corresponds to the branch or linked issue.
+   - Read its scope, implementation notes, derived decisions, deferred work, and completed slices.
+   - Treat the actual branch diff as authoritative when the spec and implementation differ.
 
 ## Step 2: Analyze and Update
 
-Base your updates on the collected information (PR Description, Issue Context, and Diff).
+Base your updates on the issue, implementation spec, commit history, and branch diff.
 
 ## What to Update
 
@@ -59,7 +60,7 @@ Your goal is to capture **implicit, high-level, and structural** knowledge that 
 
 ## Step 3: Update README.md
 
-README.md is a human developer-facing file that serves as the entry point to the repository. If, and ONLY if, there are any significant changes in the recent PR that warrant a change to README.md, also update it.
+README.md is a human developer-facing file that serves as the entry point to the repository. If, and ONLY if, there are significant changes on the branch that warrant a change to README.md, also update it.
 
 README.md should have a high level overview of the project and it's end-to-end function and purpose. It should have an architecture overview section. It should have a dependencies and prerequisites section. It should have development instructions for how to run the code. Make sure these aspects are present and up-to-date.
 
@@ -68,7 +69,7 @@ Keep it high-level in the README.md and don't go into nitty gritty details about
 ## Execution Steps
 
 1. **Read `AGENTS.md`**: Familiarize yourself with the current structure, tone, and categories.
-2. **Synthesize Changes**: Analyze the PR info and Diff to identify *structural* and *architectural* shifts.
+2. **Synthesize Changes**: Analyze the issue, spec, commits, and diff to identify *structural* and *architectural* shifts.
 3. **Edit `AGENTS.md`**:
    - **Add** new sections for entirely new domains or features.
    - **Update** existing sections (e.g., "Project overview", "Services and integrations", "Infrastructure") with new details.

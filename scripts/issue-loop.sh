@@ -21,9 +21,9 @@
 #   4. spec-review — non-interactive critique passes over the spec (default 1)
 #   5. implement   — /implement-spec, test-first, slice by slice
 #   6. techdebt    — /techdebt over the whole branch
-#   7. pr          — push, write a description from the diff, open the PR
-#   8. review      — /pr-review ⇄ fix, ending on a review so the count is honest
-#   9. context     — /update-context against the PR
+#   7. review      — /branch-review ⇄ fix, ending on a review so the count is honest
+#   8. context     — /update-context against the local branch diff
+#   9. pr          — push, write a description from the final diff, open the PR
 #
 # Every stage is a separate `claude -p` process with a clean context window;
 # state moves between them through git and files on disk, never through context.
@@ -32,7 +32,7 @@
 #            tail -f .loops/latest/run.log
 #
 # Exit codes are load-bearing:
-#   0  PR open, review clean
+#   0  selected stages complete; review clean if one ran
 #   2  preflight or usage error — nothing was touched
 #   3  needs a human: the spec BLOCKED, or findings remain after the fix rounds
 #   4  account spend/usage limit — resume with --from once it resets
@@ -58,12 +58,12 @@ MUST_IGNORE+=("scripts/issue-loop.sh")
 
 # Report the number of blocking findings that survive the LAST fix, not the one
 # the review before it counted. Worth one extra review pass here: a single-issue
-# run has no queue to get through, and a wrong needs-human label on the only PR
-# is the whole output of the run. Its own env var because the lib has already
-# defaulted FINAL_VERIFY_REVIEW to 0 by the time this line runs.
+# run has no queue to get through, and a wrong needs-human label on the issue
+# misrepresents the whole output of the run. Its own env var because the lib
+# has already defaulted FINAL_VERIFY_REVIEW to 0 by the time this line runs.
 FINAL_VERIFY_REVIEW="${ISSUE_LOOP_FINAL_VERIFY:-1}"
 
-STAGE_ORDER=(spec spec-review implement techdebt pr review context)
+STAGE_ORDER=(spec spec-review implement techdebt review context pr)
 
 # The fallback matcher (see adopt_with_agent). Cheap on purpose: it reads two
 # lists of names and picks from them, which is not work that needs a big model.
@@ -86,11 +86,11 @@ usage: ./scripts/issue-loop.sh <issue-number> [options]
   --branch <name>     use this branch instead of the inferred one
   --spec <path>       use this spec path instead of the inferred one
   --merge-base        merge origin/<base> into the branch if it has fallen behind
-  --no-push           never push and never open a PR (implies --skip pr,review,context)
+  --no-push           never push and never open a PR (implies --skip pr)
   --no-adopt          skip the fallback matcher; if the naming convention was not
                       followed, just create the conventional branch and spec
 
-stages: spec, spec-review, implement, techdebt, pr, review, context
+stages: spec, spec-review, implement, techdebt, review, context, pr
 EOF
 }
 
@@ -144,7 +144,7 @@ done
 
 [[ "$ISSUE" =~ ^[0-9]+$ ]] || { usage >&2; exit 2; }
 [[ -n "$STAGES" ]] || STAGES=$(join_stages "${STAGE_ORDER[@]}")
-(( NO_PUSH )) && SKIP="${SKIP:+$SKIP,}pr,review,context"
+(( NO_PUSH )) && SKIP="${SKIP:+$SKIP,}pr"
 
 # Materialise the selection once, so `want` is a lookup and not a parse.
 declare -A WANT=()
@@ -646,7 +646,7 @@ fi
 
 if want spec || want spec-review; then
   grep -q '^## Derived decisions' "$SPEC" \
-    || warn "#$ISSUE: the spec has no 'Derived decisions' section — review this PR harder"
+    || warn "#$ISSUE: the spec has no 'Derived decisions' section — review this branch harder"
 fi
 
 # ── 3. implement ──────────────────────────────────────────────────────────
@@ -674,16 +674,49 @@ fi
 
 commit_leftovers "chore(#$ISSUE): stage leftovers"
 
-# ── 5. PR ─────────────────────────────────────────────────────────────────
-PR_NUM=""; PR_URL=""
-if want pr; then
+# ── 5. review ⇄ fix ───────────────────────────────────────────────────────
+BLOCKING=0
+REVIEWED=0
+if want review; then
+  REVIEWED=1
+  review_fix_cycle "$ISSUE" "$DIR" "$SPEC" "$BASE_BRANCH"
+  if (( BLOCKING == 0 )); then
+    gh issue edit "$ISSUE" --remove-label "$NEEDS_HUMAN_LABEL" >>"$LOG" 2>&1 \
+      && log "   cleared $NEEDS_HUMAN_LABEL on issue #$ISSUE"
+  else
+    gh issue edit "$ISSUE" --add-label "$NEEDS_HUMAN_LABEL" >>"$LOG" 2>&1
+    if (( BLOCKING > 0 )); then
+      warn "#$ISSUE: $BLOCKING blocking finding(s) survive $MAX_REVIEW_ROUNDS fix round(s)"
+    else
+      warn "#$ISSUE: the review could not complete — the branch is UNVERIFIED, not necessarily wrong"
+    fi
+  fi
+  (( USAGE_LIMIT_HIT )) && warn "account limit reached during review"
+fi
+
+# ── 6. context ────────────────────────────────────────────────────────────
+# Do not document or publish a branch whose review is incomplete. A resumed
+# `--from review` run will review the fixes, update context, and then open the PR.
+if want context && ! (( USAGE_LIMIT_HIT )) && (( BLOCKING == 0 )); then
+  run_update_context "$ISSUE" "$DIR" "$SPEC" \
+    || bail context "the context update stage failed"
+fi
+
+# Capture context edits before PR generation so the published diff and
+# description include the final documentation.
+commit_leftovers "chore(#$ISSUE): final leftovers"
+
+# ── 7. PR ─────────────────────────────────────────────────────────────────
+PR_NUM=""; PR_URL=""; BRANCH_PUSHED=0
+if want pr && ! (( USAGE_LIMIT_HIT )) && (( BLOCKING == 0 )); then
   if want implement && \
      [[ -z "$(git diff --name-only "origin/$BASE_BRANCH...HEAD" -- . ":!$SPEC")" ]]; then
     bail pr "no implementation landed — the branch is only the spec"
   fi
   git push -u origin "$BRANCH" >>"$LOG" 2>&1 || bail pr "push failed"
+  BRANCH_PUSHED=1
 
-  stage "pr-body" "$CODE_MODEL" "$HIGH" "$(cat <<EOF
+  if ! stage "pr-body" "$CODE_MODEL" "$HIGH" "$(cat <<EOF
 /clear-technical-writing
 
 Write a pull request description for branch ${BRANCH} against ${BASE_BRANCH},
@@ -701,7 +734,10 @@ reviewer reads first. Also list the spec's Deferred items under "## Deferred".
 Say plainly what a reviewer cannot verify from CI — anything that needs a
 machine, an OS, or hardware this run did not have.
 EOF
-)" "$DIR/prbody.json" || warn "pr-body stage failed — falling back to a minimal PR"
+)" "$DIR/prbody.json"; then
+    (( USAGE_LIMIT_HIT )) && bail pr "account limit reached while writing the PR description"
+    warn "pr-body stage failed — falling back to a minimal PR"
+  fi
 
   if [[ -s "$DIR/pr.md" ]]; then
     PR_TITLE=$(head -n1 "$DIR/pr.md")
@@ -721,50 +757,24 @@ EOF
       --title "$PR_TITLE" --body-file "$DIR/pr-body.md" >>"$LOG" 2>&1 \
       || bail pr "gh pr create failed"
   fi
-fi
 
-# Re-read rather than trust: `gh pr create` does not hand back the number, and a
-# run resumed with --from review never entered the block above at all.
-PR_NUM=$(gh pr view "$BRANCH" --json number -q .number 2>/dev/null)
-if want review || want context; then
-  [[ -n "$PR_NUM" ]] || bail pr "no open PR for $BRANCH — rerun including the 'pr' stage"
-fi
-if [[ -n "$PR_NUM" ]]; then
+  # Re-read rather than trust: `gh pr create` does not hand back the number.
+  PR_NUM=$(gh pr view "$BRANCH" --json number -q .number 2>/dev/null)
+  [[ -n "$PR_NUM" ]] || bail pr "the PR was opened but its number could not be resolved"
   PR_URL=$(gh pr view "$BRANCH" --json url -q .url 2>/dev/null)
   log "   PR #$PR_NUM: $PR_URL"
 fi
 
-# ── 6. review ⇄ fix ───────────────────────────────────────────────────────
-BLOCKING=0
-REVIEWED=0
-if want review; then
-  REVIEWED=1
-  review_fix_cycle "$ISSUE" "$DIR" "$SPEC" "$PR_NUM"
-  if (( BLOCKING == 0 )); then
-    gh pr edit "$PR_NUM" --remove-label "$NEEDS_HUMAN_LABEL" >>"$LOG" 2>&1 \
-      && log "   cleared $NEEDS_HUMAN_LABEL on PR #$PR_NUM"
+# Keep a recoverable remote branch even when review findings prevented the PR.
+# `--no-push` is the explicit local-only exception.
+if ! (( NO_PUSH || BRANCH_PUSHED )); then
+  if git push -u origin "$BRANCH" >>"$LOG" 2>&1; then
+    BRANCH_PUSHED=1
+    log "   pushed $BRANCH for recovery"
   else
-    gh pr edit "$PR_NUM" --add-label "$NEEDS_HUMAN_LABEL" >>"$LOG" 2>&1
-    if (( BLOCKING > 0 )); then
-      warn "#$ISSUE: $BLOCKING blocking finding(s) survive $MAX_REVIEW_ROUNDS fix round(s)"
-    else
-      warn "#$ISSUE: the review could not complete — the PR is UNVERIFIED, not necessarily wrong"
-    fi
+    warn "could not push $BRANCH — the latest branch state remains local"
   fi
-  (( USAGE_LIMIT_HIT )) && warn "account limit reached during review"
 fi
-
-# ── 7. context ────────────────────────────────────────────────────────────
-if want context && ! (( USAGE_LIMIT_HIT )); then
-  run_update_context "$ISSUE" "$PR_NUM" "$DIR"
-fi
-
-# Anything a stage left behind, plus any commit the review cycle did not push.
-# `-u origin $BRANCH`, not a bare `git push`: a run that stopped before the pr
-# stage (--stages spec, say) never set an upstream, and a bare push there fails
-# into the log and strands the commit locally.
-commit_leftovers "chore(#$ISSUE): final leftovers"
-(( NO_PUSH )) || git push -u origin "$BRANCH" >>"$LOG" 2>&1
 
 # ── summary ───────────────────────────────────────────────────────────────
 # Deliberately no `return_to_base`: this run produced one branch and you are
@@ -776,6 +786,13 @@ commit_leftovers "chore(#$ISSUE): final leftovers"
   echo "$TITLE"
   echo
   echo "branch: $BRANCH  ($(git log --oneline -1))"
+  if (( NO_PUSH )); then
+    echo "remote: not pushed (--no-push)"
+  elif (( BRANCH_PUSHED )); then
+    echo "remote: pushed to origin"
+  else
+    echo "remote: push failed; the latest branch state may exist only locally"
+  fi
   echo "spec:   $SPEC"
   [[ -n "$PR_URL" ]] && echo "PR:     $PR_URL"
   echo "stages: ${SELECTED[*]}"
@@ -791,8 +808,14 @@ commit_leftovers "chore(#$ISSUE): final leftovers"
     echo "NEEDS YOU — $BLOCKING blocking finding(s) remain, verified against the"
     echo "current diff. They are written out in full at:"
     echo "  $DIR/review-verify.md   (or review-$MAX_REVIEW_ROUNDS.md)"
+    echo "Fix them on this branch, then resume with:"
+    echo "  ./scripts/issue-loop.sh $ISSUE --from review"
   elif (( BLOCKING < 0 )); then
     echo "UNVERIFIED — the review never returned a verdict. Read $DIR/review-*.md."
+    echo "Resolve the review failure, then resume with:"
+    echo "  ./scripts/issue-loop.sh $ISSUE --from review"
+  elif [[ -z "$PR_URL" ]]; then
+    echo "Review came back clean. No PR was opened because the pr stage was not selected."
   else
     echo "Review came back clean. Read the PR's 'Decided without human input'"
     echo "section first — that is where an unattended run hides its guesses."

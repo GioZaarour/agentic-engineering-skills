@@ -1,7 +1,8 @@
 <!--
   Copy this to `.loop-notes.md` at your repo root and rewrite it for your
-  project. Every stage of the loop — spec, implement, techdebt, review, fix —
-  gets this text appended to its prompt, under the machine budget.
+  project. Every model-driven stage of the loop — spec, implement, techdebt,
+  review, fix, context, and PR writing — gets this text appended to its prompt,
+  under the machine budget.
 
   Write it for a competent engineer who has never seen this repo and cannot ask
   you anything. Commands, not adjectives. The things that go here are the ones

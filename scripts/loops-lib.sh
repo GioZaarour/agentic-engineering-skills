@@ -3,7 +3,7 @@
 # loops-lib.sh — shared core for the unattended issue loop.
 #
 # Sourced by:
-#   issue-loop.sh   one GitHub issue, spec → implement → PR → review → context
+#   issue-loop.sh   one GitHub issue, spec → implement → review → context → PR
 #
 # Everything the loop must not get wrong twice lives here: the model/effort
 # choices, the measured machine budget injected into every prompt, and the
@@ -22,7 +22,7 @@ set -uo pipefail   # deliberately NOT -e: stage failures are handled, not fatal
 # macOS still ships bash 3.2 as /bin/bash, so this is a real failure mode and
 # not a theoretical one — and its symptom without this check is a cryptic
 # syntax error a hundred lines from the cause.
-if (( BASH_VERSINFO[0] < 4 )); then
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 2) )); then
   echo "these scripts need bash 4.2 or newer; this is bash ${BASH_VERSION}" >&2
   echo "macOS ships bash 3.2 — install a newer one (brew install bash) and run" >&2
   echo "the script with it, or put it earlier on PATH than /bin/bash." >&2
@@ -48,7 +48,7 @@ FEATURE_LABELS="${FEATURE_LABELS:-^(feature|enhancement|feat)$}"
 #   BASE_BRANCH=v0/feature/56-history ./scripts/issue-loop.sh 57
 BASE_BRANCH="${BASE_BRANCH:-main}"
 
-PLAN_MODEL="${PLAN_MODEL:-claude-opus-5}"    # spec derivation, spec review, PR review
+PLAN_MODEL="${PLAN_MODEL:-claude-opus-5}"    # spec derivation, spec review, branch review
 CODE_MODEL="${CODE_MODEL:-claude-sonnet-5}"  # implementation, tech debt, fixes, context
 
 XHIGH="${XHIGH:-xhigh}"        # verified against `claude --help`:
@@ -78,12 +78,12 @@ TECHDEBT_LABEL="${TECHDEBT_LABEL:-techdebt}"
 MAX_REVIEW_ROUNDS="${MAX_REVIEW_ROUNDS:-2}"
 
 # review_fix_cycle's loop exits right after a FIX, so the count it reports is
-# the one the review found BEFORE that fix ran — a PR can be labelled "2
-# blocking" when the last fix round already addressed both. Set this to 1 to
-# spend one more review pass and report a number that describes the code as it
-# actually stands. Off by default here; issue-loop.sh turns it on, because a
-# single-issue run has no queue to get through and a wrong needs-human label on
-# the only PR is the whole output of the run.
+# the one the review found BEFORE that fix ran — a branch can be reported as
+# having two blocking findings when the last fix round already addressed both.
+# Set this to 1 to spend one more review pass and report a number that describes
+# the code as it actually stands. Off by default here; issue-loop.sh turns it on,
+# because a single-issue run has no queue to get through and a wrong needs-human
+# label on the issue misrepresents the whole output of the run.
 FINAL_VERIFY_REVIEW="${FINAL_VERIFY_REVIEW:-0}"
 STAGE_TIMEOUT="${STAGE_TIMEOUT:-14400}"      # 4h/stage. A wedge detector, not a pace target.
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"            # NOT used for timeouts or account limits
@@ -480,7 +480,7 @@ preflight_common() {
   # these usually are), and under `set -o pipefail` that reports failure even
   # though grep matched — a false warning every time, which hides the real one.
   local cmd d found
-  for cmd in spec-from-issue implement-spec techdebt pr-review update-context clear-technical-writing; do
+  for cmd in spec-from-issue implement-spec techdebt branch-review update-context clear-technical-writing; do
     found=0
     for d in .claude/commands "$HOME/.claude/commands"; do
       [[ -f "$d/${cmd}.md" ]] && { found=1; break; }
@@ -506,13 +506,18 @@ preflight_common() {
 # The reviewer prompt, in one place so the round-N pass and the final
 # verification pass cannot drift into judging by different standards.
 review_prompt() {
+  local base="$1"
   cat <<EOF
-/pr-review ${1}
+/branch-review ${base}
 
 /clear-technical-writing
 
 Review in full, in prose, exactly as you normally would. Do not compress your
 findings into a list for a machine.
+
+The feature branch is intentionally still local at this point. Review the local
+merge-base diff against origin/${base}; do not require an upstream branch
+or an open pull request, and do not push anything.
 
 ${RESOURCE_NOTE}
 
@@ -523,18 +528,18 @@ BLOCKING: <count of findings you rated critical or major>
 EOF
 }
 
-# ── review_fix_cycle <issue> <dir> <spec> <pr-num> ────────────────────────
+# ── review_fix_cycle <issue> <dir> <spec> <base> ──────────────────────────
 # The reviewer/fixer ping-pong. Sets BLOCKING:
 #   0   clean
 #   >0  findings remain after MAX_REVIEW_ROUNDS
 #   -1  a stage failed, or the reviewer emitted no sentinel — unverified
-# Pushes after each fix round. Does not touch labels; the caller owns that.
+# Keeps all fixes local. Does not touch labels; the caller owns that.
 review_fix_cycle() {
-  local issue="$1" dir="$2" spec="$3" prnum="$4" round
+  local issue="$1" dir="$2" spec="$3" base="$4" round
   BLOCKING=0
   for round in $(seq 1 "$MAX_REVIEW_ROUNDS"); do
     stage "review r$round" "$PLAN_MODEL" "$XHIGH" \
-      "$(review_prompt "$prnum")" "$dir/review-$round.json" || { BLOCKING=-1; break; }
+      "$(review_prompt "$base")" "$dir/review-$round.json" || { BLOCKING=-1; break; }
 
     jq -r '.result' "$dir/review-$round.json" > "$dir/review-$round.md"
     BLOCKING=$(grep -oE '^BLOCKING:[[:space:]]*[0-9]+' "$dir/review-$round.md" \
@@ -547,7 +552,7 @@ review_fix_cycle() {
     (( BLOCKING == 0 )) && break
 
     stage "fix r$round" "$CODE_MODEL" "$XHIGH" "$(cat <<EOF
-The full PR review for this branch is at ${dir}/review-${round}.md. Read it.
+The full branch review is at ${dir}/review-${round}.md. Read it.
 
 Fix every finding the review rates critical or major.
 
@@ -559,7 +564,7 @@ false positive is worse than leaving the finding open.
 Tests stay green. A fix without a test that would have caught the finding is
 not done.
 
-Do NOT fix medium or minor findings. Collect them into ONE issue for this PR —
+Do NOT fix medium or minor findings. Collect them into ONE issue for this branch —
 one across ALL review rounds, not one per round. You are a fresh process with
 no memory of earlier rounds, so an issue may already exist. Look before you
 file:
@@ -583,7 +588,6 @@ EOF
 )" "$dir/fix-$round.json" || { BLOCKING=-1; break; }
 
     commit_leftovers "fix(#$issue): review round $round leftovers"
-    git push >>"$LOG" 2>&1
   done
 
   # Falling out of the loop with BLOCKING > 0 means the last thing that ran was
@@ -592,7 +596,7 @@ EOF
   # — the tree is in an unknown state and a clean verdict would be a lie.
   if (( FINAL_VERIFY_REVIEW )) && (( BLOCKING > 0 )); then
     if stage "review verify" "$PLAN_MODEL" "$XHIGH" \
-         "$(review_prompt "$prnum")" "$dir/review-verify.json"; then
+         "$(review_prompt "$base")" "$dir/review-verify.json"; then
       jq -r '.result' "$dir/review-verify.json" > "$dir/review-verify.md"
       local verified
       verified=$(grep -oE '^BLOCKING:[[:space:]]*[0-9]+' "$dir/review-verify.md" \
@@ -610,20 +614,23 @@ EOF
   return 0
 }
 
-# ── run_update_context <issue> <pr-num> <dir> ─────────────────────────────
-# The skill is `# Update Context from PR #$1` and opens with `gh pr checkout $1`
-# — it needs the number, not a branch.
+# ── run_update_context <issue> <dir> <spec> ───────────────────────────────
+# Context is derived from the local branch diff so the documentation is
+# complete before the branch is pushed and the PR is opened.
 run_update_context() {
-  local issue="$1" prnum="$2" dir="$3"
+  local issue="$1" dir="$2" spec="$3"
   stage "update-context" "$CODE_MODEL" "$HIGH" "$(cat <<EOF
-/update-context ${prnum}
+/update-context ${BASE_BRANCH}
 
 /clear-technical-writing
 
+Use issue #${issue}, the implementation spec at ${spec}, and the local
+merge-base diff against origin/${BASE_BRANCH}. Do not fetch, push, check out
+another branch, or open a pull request.
+
 ${RESOURCE_NOTE}
 EOF
-)" "$dir/ctx.json" || { warn "#$issue: update-context failed (the PR itself is fine)"; return 1; }
+)" "$dir/ctx.json" || { warn "#$issue: update-context failed"; return 1; }
   commit_leftovers "docs(#$issue): update AGENTS.md context"
-  git push >>"$LOG" 2>&1
   return 0
 }
