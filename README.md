@@ -205,6 +205,7 @@ Everything is an environment variable with a sane default; there is no config fi
 |---|---|---|
 | `PLAN_MODEL` | `claude-opus-5` | Spec derivation, spec review, branch review |
 | `CODE_MODEL` | `claude-sonnet-5` | Implementation, techdebt, fixes, context |
+| `LOOP_AUTH` | `subscription` | Which credentials every stage bills to. `subscription` unsets `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` for the run, because `claude` prefers an exported key over your claude.ai login, and preflight then stops the run unless `claude auth status` reports subscription billing. That catches an `apiKeyHelper`, a Console login, and no login at all. Set `api-key` to bill the API key instead. |
 | `BASE_BRANCH` | `main` | What the PR targets, and what new branches are cut from. Set it to an unmerged branch to stack work on top of it. |
 | `VERSION_SEGMENT` | `v0` | The first path segment in branch and spec names |
 | `DEFAULT_TYPE` | `bugfix` | Used when labels and the title say nothing |

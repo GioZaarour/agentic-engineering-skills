@@ -51,6 +51,20 @@ BASE_BRANCH="${BASE_BRANCH:-main}"
 PLAN_MODEL="${PLAN_MODEL:-claude-opus-5}"    # spec derivation, spec review, branch review
 CODE_MODEL="${CODE_MODEL:-claude-sonnet-5}"  # implementation, tech debt, fixes, context
 
+# Which credentials every `claude -p` stage bills to. `claude` prefers
+# ANTHROPIC_API_KEY over a claude.ai login whenever the variable is set, so a key
+# exported from a shell rc for some unrelated tool silently turns an unattended
+# run into pay-as-you-go API usage — and when that key's balance is empty, every
+# stage fails with "Credit balance is too low" while the subscription sits idle.
+#   subscription (default) — unset the key vars for this run; use the claude.ai login
+#   api-key                — leave the environment alone and bill the API key
+LOOP_AUTH="${LOOP_AUTH:-subscription}"
+case "$LOOP_AUTH" in
+  subscription) unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ;;
+  api-key) ;;
+  *) echo "LOOP_AUTH must be 'subscription' or 'api-key', not '$LOOP_AUTH'" >&2; exit 2 ;;
+esac
+
 XHIGH="${XHIGH:-xhigh}"        # verified against `claude --help`:
 HIGH="${HIGH:-high}"           #   --effort accepts low|medium|high|xhigh|max
 
@@ -353,17 +367,22 @@ stage() {
     fi
     # Retrying into an exhausted account burns an hour of backoff and a dozen
     # pointless API calls re-confirming the same 429 across every remaining
-    # stage. Stop the run instead, with the branch left recoverable.
-    if jq -e '(.api_error_status == 429)
-              and ((.result // "") | test("spend limit|usage limit|rate limit"; "i"))' \
+    # stage. Stop the run instead, with the branch left recoverable. An empty
+    # API-key balance is the same situation arriving as a 400.
+    if jq -e '(.api_error_status == 429 or .api_error_status == 400)
+              and ((.result // "") | test("spend limit|usage limit|rate limit|credit balance"; "i"))' \
          "$out" >/dev/null 2>&1; then
       warn "$label: $(jq -r '.result' "$out" 2>/dev/null | head -1)"
       warn "ACCOUNT LIMIT REACHED — aborting; remaining work is untouched"
       USAGE_LIMIT_HIT=1
       return 1
     fi
-    jq -r '.subtype // .error // empty' "$out" 2>/dev/null | head -1 \
-      | grep -q . && warn "$label: $(jq -r '.subtype // .error' "$out" 2>/dev/null | head -1)"
+    # An API error still carries subtype:"success", so printing .subtype logs
+    # "success" for a failure. When is_error is set, .result holds the message.
+    local why
+    why=$(jq -r 'if .is_error then "\(.api_error_status // "error") \(.result // "")"
+                 else (.subtype // .error // empty) end' "$out" 2>/dev/null | head -1)
+    [[ -n "$why" ]] && warn "$label: $why"
   done
   warn "$label failed after $MAX_ATTEMPTS attempts (exit $rc) — see $out"
   return 1
@@ -426,6 +445,29 @@ preflight_common() {
   log "preflight"
   log "   host: ${CORES} cores, ${MEM_TOTAL_MB} MB RAM, ${SWAP_TOTAL_MB} MB swap, ${DISK_FREE_GB} GB free"
   log "   budget: -j${BUILD_JOBS} builds, ${SUBAGENT_CAP} subagent(s), worktrees=${ALLOW_WORKTREES}"
+  # Unsetting the key vars (see LOOP_AUTH) is not proof of subscription billing:
+  # an apiKeyHelper in settings.json or a Console login still bills the API, and
+  # with no login at all every stage fails rather than falling back. Ask claude
+  # which credentials it will actually use, and stop before any stage runs.
+  local auth
+  auth=$(claude auth status 2>/dev/null || true)
+  if [[ "$LOOP_AUTH" == subscription ]]; then
+    if ! jq -e . >/dev/null 2>&1 <<<"$auth"; then
+      warn "cannot read 'claude auth status' — billing source unverified"
+    elif jq -e '.loggedIn != true or .apiKeySource != null or .subscriptionType == null' \
+           >/dev/null 2>&1 <<<"$auth"; then
+      warn "LOOP_AUTH=subscription, but claude would not bill a claude.ai subscription:"
+      warn "   $(jq -c '{loggedIn, authMethod, apiKeySource, subscriptionType}' <<<"$auth")"
+      warn "   run 'claude auth login', or set LOOP_AUTH=api-key to bill an API key"
+      exit 2
+    else
+      log "   auth: claude.ai $(jq -r .subscriptionType <<<"$auth") subscription (API key vars unset for this run)"
+    fi
+  elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    log "   auth: ANTHROPIC_API_KEY (LOOP_AUTH=api-key)"
+  else
+    log "   auth: LOOP_AUTH=api-key but ANTHROPIC_API_KEY is not set — falling back to claude.ai login"
+  fi
 
   local bin
   for bin in claude gh jq git awk sed df; do
