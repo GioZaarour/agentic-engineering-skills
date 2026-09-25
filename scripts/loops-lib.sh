@@ -3,7 +3,7 @@
 # loops-lib.sh — shared core for the unattended issue loop.
 #
 # Sourced by:
-#   issue-loop.sh   one GitHub issue, spec → implement → review → context → PR
+#   claude-issue-loop.sh / codex-issue-loop.sh: spec → implement → review → context → PR
 #
 # Everything the loop must not get wrong twice lives here: the model/effort
 # choices, the measured machine budget injected into every prompt, and the
@@ -45,28 +45,33 @@ FEATURE_LABELS="${FEATURE_LABELS:-^(feature|enhancement|feat)$}"
 
 # The branch the PR is opened against, and the branch new work is cut from.
 # Override to stack a branch on top of an unmerged one:
-#   BASE_BRANCH=v0/feature/56-history ./scripts/issue-loop.sh 57
+#   BASE_BRANCH=v0/feature/56-history ./scripts/claude-issue-loop.sh 57
 BASE_BRANCH="${BASE_BRANCH:-main}"
 
-PLAN_MODEL="${PLAN_MODEL:-claude-opus-5}"    # spec derivation, spec review, branch review
-CODE_MODEL="${CODE_MODEL:-claude-sonnet-5}"  # implementation, tech debt, fixes, context
-
-# Which credentials every `claude -p` stage bills to. `claude` prefers
-# ANTHROPIC_API_KEY over a claude.ai login whenever the variable is set, so a key
-# exported from a shell rc for some unrelated tool silently turns an unattended
-# run into pay-as-you-go API usage — and when that key's balance is empty, every
-# stage fails with "Credit balance is too low" while the subscription sits idle.
-#   subscription (default) — unset the key vars for this run; use the claude.ai login
-#   api-key                — leave the environment alone and bill the API key
-LOOP_AUTH="${LOOP_AUTH:-subscription}"
-case "$LOOP_AUTH" in
-  subscription) unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ;;
-  api-key) ;;
-  *) echo "LOOP_AUTH must be 'subscription' or 'api-key', not '$LOOP_AUTH'" >&2; exit 2 ;;
+# Entrypoints choose the CLI; each phase can still override its model and effort.
+LOOP_CLI="${LOOP_CLI:-claude}"
+case "$LOOP_CLI" in
+  claude)
+    DEFAULT_MODEL=claude-opus-5-5
+    DEFAULT_ADOPT_MODEL=claude-sonnet-5
+    # Prefer the subscription even when a shell profile exports an API key.
+    LOOP_AUTH="${LOOP_AUTH:-subscription}"
+    case "$LOOP_AUTH" in
+      subscription) unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ;;
+      api-key) ;;
+      *) echo "LOOP_AUTH must be 'subscription' or 'api-key', not '$LOOP_AUTH'" >&2; exit 2 ;;
+    esac
+    ;;
+  codex)
+    DEFAULT_MODEL=gpt-6-sol
+    DEFAULT_ADOPT_MODEL=gpt-6-sol
+    ;;
+  *) echo "unknown loop CLI: $LOOP_CLI" >&2; exit 2 ;;
 esac
-
-XHIGH="${XHIGH:-xhigh}"        # verified against `claude --help`:
-HIGH="${HIGH:-high}"           #   --effort accepts low|medium|high|xhigh|max
+PLAN_MODEL="${PLAN_MODEL:-$DEFAULT_MODEL}"
+CODE_MODEL="${CODE_MODEL:-$DEFAULT_MODEL}"
+PLAN_EFFORT="${PLAN_EFFORT:-high}"
+CODE_EFFORT="${CODE_EFFORT:-medium}"
 
 # Where this run's artifacts go, relative to the repo root. It must be ignored
 # by git on every branch; preflight_common takes care of that for you.
@@ -95,7 +100,7 @@ MAX_REVIEW_ROUNDS="${MAX_REVIEW_ROUNDS:-2}"
 # the one the review found BEFORE that fix ran — a branch can be reported as
 # having two blocking findings when the last fix round already addressed both.
 # Set this to 1 to spend one more review pass and report a number that describes
-# the code as it actually stands. Off by default here; issue-loop.sh turns it on,
+# the code as it actually stands. Off by default here; the issue entrypoint turns it on,
 # because a single-issue run has no queue to get through and a wrong needs-human
 # label on the issue misrepresents the whole output of the run.
 FINAL_VERIFY_REVIEW="${FINAL_VERIFY_REVIEW:-0}"
@@ -114,6 +119,12 @@ DEADLINE_HOURS="${DEADLINE_HOURS:-168}"      # effectively off; a runaway backst
 #   TOTAL_BUDGET_USD  → checked by stage() before each stage starts
 STAGE_BUDGET_USD="${STAGE_BUDGET_USD:-0}"
 TOTAL_BUDGET_USD="${TOTAL_BUDGET_USD:-0}"
+
+# Codex reports token usage, not dollar cost, and has no per-stage dollar cap.
+if [[ "$LOOP_CLI" == codex && ( "$STAGE_BUDGET_USD" != 0 || "$TOTAL_BUDGET_USD" != 0 ) ]]; then
+  echo "Codex does not support STAGE_BUDGET_USD or TOTAL_BUDGET_USD; leave both at 0." >&2
+  exit 2
+fi
 
 if [[ "$STAGE_BUDGET_USD" != "0" ]]; then
   BUDGET_ARGS=(--max-budget-usd "$STAGE_BUDGET_USD")
@@ -319,8 +330,47 @@ init_run() {
 log()  { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG"; }
 warn() { printf '%s  !! %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG" >&2; }
 
-# ── stage <label> <model> <effort> <prompt> <outfile> [extra claude args...] ──
-# Runs one claude -p process. Retries with backoff on fast failures. Three
+# Run Codex with stage()'s timeout prefix. Preserve the event stream and final
+# text, then adapt them to the result document consumed by the shared workflow.
+run_codex_stage() {
+  local model="$1" effort="$2" prompt="$3" out="$4"; shift 4
+  local events="${out%.json}.events.jsonl" message="${out%.json}.last.txt"
+  local errors="${out%.json}.stderr.log" rc
+  local -a permissions=(--sandbox danger-full-access)
+  [[ "$TOOLS" == "Read,Glob,Grep" ]] && permissions=(--sandbox read-only)
+
+  # Codex explicitly invokes skills with $name rather than Claude's /name.
+  prompt=$(sed -E 's#^/(spec-from-issue|implement-spec|techdebt|branch-review|update-context|clear-technical-writing)([[:space:]]|$)#$\1\2#' <<<"$prompt")
+  # A failed retry must not reuse the previous attempt's final message.
+  : > "$message"
+  ${runner[@]+"${runner[@]}"} codex exec --model "$model" \
+    -c "model_reasoning_effort=\"$effort\"" -c 'approval_policy="never"' \
+    "${permissions[@]}" --json --output-last-message "$message" \
+    "$@" - <<<"$prompt" > "$events" 2> "$errors"
+  rc=$?
+  cat "$errors" >> "$LOG"
+
+  # Exit 0 alone is insufficient: interrupted streams and turn.failed events
+  # must not let the next stage consume a partial answer as a completed review.
+  if ! jq -s --argjson rc "$rc" --rawfile result "$message" --rawfile stderr "$errors" '
+      (any(.[]; .type == "turn.completed") and
+       (any(.[]; .type == "turn.failed") | not) and
+       $rc == 0 and ($result | length) > 0) as $ok |
+      {provider: "codex", is_error: ($ok | not),
+       result: (if $ok then $result else
+         ([.[] | select(.type == "turn.failed" or .type == "error") |
+           (.error.message // .message // "Codex turn failed")] + [$stderr] | join("\n")) end),
+       usage: ([.[] | select(.type == "turn.completed") | .usage] | last),
+       session_id: ([.[] | select(.type == "thread.started") | .thread_id] | last)}
+    ' "$events" > "$out"; then
+    jq -n --rawfile stderr "$errors" \
+      '{provider: "codex", is_error: true, result: ("Invalid Codex event stream\n" + $stderr)}' > "$out"
+  fi
+  return "$rc"
+}
+
+# ── stage <label> <model> <effort> <prompt> <outfile> [extra CLI args...] ──
+# Runs one fresh CLI process. Retries with backoff on fast failures. Three
 # outcomes are deliberately NOT retried, each for a different reason:
 #   timeout        — attempt 2 would start on attempt 1's half-finished tree
 #   account limit  — resets on the billing cycle, not in 15 minutes
@@ -347,14 +397,19 @@ stage() {
       sleep "${BACKOFF[attempt-1]}"
     fi
     log "   ▶ $label ($model${effort:+ $effort})"
-    ${runner[@]+"${runner[@]}"} claude -p "$prompt" \
-      --model "$model" ${effort:+--effort "$effort"} \
-      --permission-mode "$PERMISSION_MODE" \
-      --allowedTools "$TOOLS" \
-      "${BUDGET_ARGS[@]}" \
-      --output-format json \
-      "$@" > "$out" 2>>"$LOG"
-    rc=$?
+    if [[ "$LOOP_CLI" == codex ]]; then
+      run_codex_stage "$model" "$effort" "$prompt" "$out" "$@"
+      rc=$?
+    else
+      ${runner[@]+"${runner[@]}"} claude -p "$prompt" \
+        --model "$model" ${effort:+--effort "$effort"} \
+        --permission-mode "$PERMISSION_MODE" \
+        --allowedTools "$TOOLS" \
+        "${BUDGET_ARGS[@]}" \
+        --output-format json \
+        "$@" > "$out" 2>>"$LOG"
+      rc=$?
+    fi
     # A result document is not success. A 429 carries subtype:"success" AND
     # is_error:true AND a .result string — gating on `.result` existing (the
     # obvious check) scores every rate-limited stage as a pass. Gate on is_error.
@@ -369,8 +424,8 @@ stage() {
     # pointless API calls re-confirming the same 429 across every remaining
     # stage. Stop the run instead, with the branch left recoverable. An empty
     # API-key balance is the same situation arriving as a 400.
-    if jq -e '(.api_error_status == 429 or .api_error_status == 400)
-              and ((.result // "") | test("spend limit|usage limit|rate limit|credit balance"; "i"))' \
+    if jq -e '(.is_error == true) and (.api_error_status == 429 or .api_error_status == 400 or .provider == "codex")
+              and ((.result // "") | test("spend limit|usage limit|rate limit|credit balance|quota|usage_limit|rate_limit"; "i"))' \
          "$out" >/dev/null 2>&1; then
       warn "$label: $(jq -r '.result' "$out" 2>/dev/null | head -1)"
       warn "ACCOUNT LIMIT REACHED — aborting; remaining work is untouched"
@@ -403,6 +458,14 @@ spent_usd() {
   shopt -u nullglob
   (( ${#files[@]} )) || { echo 0; return 0; }
   jq -s 'map(.total_cost_usd // 0)|add // 0' "${files[@]}" 2>/dev/null || echo 0
+}
+
+report_cost() {
+  if [[ "$LOOP_CLI" == codex ]]; then
+    echo "cost:   unavailable (Codex records token usage in stage JSON)"
+  else
+    printf 'cost:   $%s\n' "$(spent_usd)"
+  fi
 }
 
 # Return the tree to a known-good state.
@@ -445,34 +508,40 @@ preflight_common() {
   log "preflight"
   log "   host: ${CORES} cores, ${MEM_TOTAL_MB} MB RAM, ${SWAP_TOTAL_MB} MB swap, ${DISK_FREE_GB} GB free"
   log "   budget: -j${BUILD_JOBS} builds, ${SUBAGENT_CAP} subagent(s), worktrees=${ALLOW_WORKTREES}"
-  # Unsetting the key vars (see LOOP_AUTH) is not proof of subscription billing:
-  # an apiKeyHelper in settings.json or a Console login still bills the API, and
-  # with no login at all every stage fails rather than falling back. Ask claude
-  # which credentials it will actually use, and stop before any stage runs.
-  local auth
-  auth=$(claude auth status 2>/dev/null || true)
-  if [[ "$LOOP_AUTH" == subscription ]]; then
-    if ! jq -e . >/dev/null 2>&1 <<<"$auth"; then
-      warn "cannot read 'claude auth status' — billing source unverified"
-    elif jq -e '.loggedIn != true or .apiKeySource != null or .subscriptionType == null' \
-           >/dev/null 2>&1 <<<"$auth"; then
-      warn "LOOP_AUTH=subscription, but claude would not bill a claude.ai subscription:"
-      warn "   $(jq -c '{loggedIn, authMethod, apiKeySource, subscriptionType}' <<<"$auth")"
-      warn "   run 'claude auth login', or set LOOP_AUTH=api-key to bill an API key"
-      exit 2
-    else
-      log "   auth: claude.ai $(jq -r .subscriptionType <<<"$auth") subscription (API key vars unset for this run)"
-    fi
-  elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
-    log "   auth: ANTHROPIC_API_KEY (LOOP_AUTH=api-key)"
-  else
-    log "   auth: LOOP_AUTH=api-key but ANTHROPIC_API_KEY is not set — falling back to claude.ai login"
-  fi
-
   local bin
-  for bin in claude gh jq git awk sed df; do
+  for bin in "$LOOP_CLI" gh jq git awk sed df; do
     command -v "$bin" >/dev/null || { warn "missing: $bin"; exit 2; }
   done
+  if [[ "$LOOP_CLI" == codex ]]; then
+    codex login status >>"$LOG" 2>&1 \
+      || { warn "codex not authenticated — run: codex login"; exit 2; }
+    log "   auth: existing Codex CLI login"
+  else
+    # Unsetting the key vars (see LOOP_AUTH) is not proof of subscription billing:
+    # an apiKeyHelper in settings.json or a Console login still bills the API, and
+    # with no login at all every stage fails rather than falling back. Ask claude
+    # which credentials it will actually use, and stop before any stage runs.
+    local auth
+    auth=$(claude auth status 2>/dev/null || true)
+    if [[ "$LOOP_AUTH" == subscription ]]; then
+      if ! jq -e . >/dev/null 2>&1 <<<"$auth"; then
+        warn "cannot read 'claude auth status' — billing source unverified"
+      elif jq -e '.loggedIn != true or .apiKeySource != null or .subscriptionType == null' \
+             >/dev/null 2>&1 <<<"$auth"; then
+        warn "LOOP_AUTH=subscription, but claude would not bill a claude.ai subscription:"
+        warn "   $(jq -c '{loggedIn, authMethod, apiKeySource, subscriptionType}' <<<"$auth")"
+        warn "   run 'claude auth login', or set LOOP_AUTH=api-key to bill an API key"
+        exit 2
+      else
+        log "   auth: claude.ai $(jq -r .subscriptionType <<<"$auth") subscription (API key vars unset for this run)"
+      fi
+    elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+      log "   auth: ANTHROPIC_API_KEY (LOOP_AUTH=api-key)"
+    else
+      log "   auth: LOOP_AUTH=api-key but ANTHROPIC_API_KEY is not set — falling back to claude.ai login"
+    fi
+  fi
+
   [[ -n "$TIMEOUT_BIN" ]] \
     || warn "no timeout/gtimeout on PATH — a wedged stage will hang forever (brew install coreutils)"
   gh auth status >/dev/null 2>&1 || { warn "gh not authenticated — run: gh auth login"; exit 2; }
@@ -522,17 +591,22 @@ preflight_common() {
   # these usually are), and under `set -o pipefail` that reports failure even
   # though grep matched — a false warning every time, which hides the real one.
   local cmd d found
+  local -a command_dirs=() skill_dirs=(.agents/skills "$HOME/.agents/skills" "${CODEX_HOME:-$HOME/.codex}/skills")
+  if [[ "$LOOP_CLI" == claude ]]; then
+    command_dirs=(.claude/commands "$HOME/.claude/commands")
+    skill_dirs=(.claude/skills "$HOME/.claude/skills" .agents/skills "$HOME/.agents/skills")
+  fi
   for cmd in spec-from-issue implement-spec techdebt branch-review update-context clear-technical-writing; do
     found=0
-    for d in .claude/commands "$HOME/.claude/commands"; do
+    for d in ${command_dirs[@]+"${command_dirs[@]}"}; do
       [[ -f "$d/${cmd}.md" ]] && { found=1; break; }
     done
     if (( ! found )); then
-      for d in .claude/skills "$HOME/.claude/skills" .agents/skills "$HOME/.agents/skills"; do
+      for d in "${skill_dirs[@]}"; do
         [[ -f "$d/${cmd}/SKILL.md" ]] && { found=1; break; }
       done
     fi
-    (( found )) || warn "no skill or command found for /$cmd — the run will fail at that stage (run ./install.sh)"
+    (( found )) || warn "no skill or command found for $cmd — the run will fail at that stage (run ./install.sh)"
   done
 
   # The labels the loop signals through. Creating them is idempotent and cheap;
@@ -580,7 +654,7 @@ review_fix_cycle() {
   local issue="$1" dir="$2" spec="$3" base="$4" round
   BLOCKING=0
   for round in $(seq 1 "$MAX_REVIEW_ROUNDS"); do
-    stage "review r$round" "$PLAN_MODEL" "$XHIGH" \
+    stage "review r$round" "$PLAN_MODEL" "$PLAN_EFFORT" \
       "$(review_prompt "$base")" "$dir/review-$round.json" || { BLOCKING=-1; break; }
 
     jq -r '.result' "$dir/review-$round.json" > "$dir/review-$round.md"
@@ -593,7 +667,7 @@ review_fix_cycle() {
     log "   review r$round: $BLOCKING blocking"
     (( BLOCKING == 0 )) && break
 
-    stage "fix r$round" "$CODE_MODEL" "$XHIGH" "$(cat <<EOF
+    stage "fix r$round" "$CODE_MODEL" "$CODE_EFFORT" "$(cat <<EOF
 The full branch review is at ${dir}/review-${round}.md. Read it.
 
 Fix every finding the review rates critical or major.
@@ -637,7 +711,7 @@ EOF
   # once and report what is actually left. -1 (a failed stage) is not re-reviewed
   # — the tree is in an unknown state and a clean verdict would be a lie.
   if (( FINAL_VERIFY_REVIEW )) && (( BLOCKING > 0 )); then
-    if stage "review verify" "$PLAN_MODEL" "$XHIGH" \
+    if stage "review verify" "$PLAN_MODEL" "$PLAN_EFFORT" \
          "$(review_prompt "$base")" "$dir/review-verify.json"; then
       jq -r '.result' "$dir/review-verify.json" > "$dir/review-verify.md"
       local verified
@@ -661,7 +735,7 @@ EOF
 # complete before the branch is pushed and the PR is opened.
 run_update_context() {
   local issue="$1" dir="$2" spec="$3"
-  stage "update-context" "$CODE_MODEL" "$HIGH" "$(cat <<EOF
+  stage "update-context" "$CODE_MODEL" "$CODE_EFFORT" "$(cat <<EOF
 /update-context ${BASE_BRANCH}
 
 /clear-technical-writing

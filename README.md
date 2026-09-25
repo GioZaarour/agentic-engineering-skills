@@ -67,60 +67,62 @@ First, start off by describing your task/issue to the maximum degree of detail a
 
 ### Loop Engineering path
 
-`scripts/issue-loop.sh` takes **one** GitHub issue from "open" to "PR under review", unattended. It is the same path as above with the human taken out: every step is a skill you can run by hand, and the script's only job is to run them in order, in separate processes, and to stop in a recoverable way when something needs you.
+`scripts/claude-issue-loop.sh` and `scripts/codex-issue-loop.sh` each take **one** GitHub issue from "open" to "PR under review", unattended. It is the same path as above with the human taken out: every step is a skill you can run by hand, and the script's only job is to run them in order, in separate processes, and to stop in a recoverable way when something needs you.
 
 ```
 preflight → resolve → sync → spec → spec-review → implement → techdebt → review ⇄ fix → context → pr
 ```
 
-Each stage is its own `claude -p` process with a clean context window. State moves between them through git and files on disk, never through a shared context — so a stage that goes wrong is bounded, and any stage can be re-run on its own.
+Both entrypoints share the workflow in `claude-issue-loop.sh` and the runner in `loops-lib.sh`. Each stage is its own `claude -p` or `codex exec` process with a clean context window. State moves between them through git and files on disk, never through a shared context — so a stage that goes wrong is bounded, and any stage can be re-run on its own.
 
 | Stage | What runs | Model |
 |---|---|---|
-| `spec` | `/spec-from-issue` — derives the spec, or iterates on one that already exists | `PLAN_MODEL` (xhigh) |
-| `spec-review` | a non-interactive critique of the spec against the actual code | `PLAN_MODEL` (xhigh) |
-| `implement` | `/implement-spec` — test-first, slice by slice | `CODE_MODEL` (xhigh) |
-| `techdebt` | `/techdebt` over the whole branch diff | `CODE_MODEL` (high) |
-| `review` | `/branch-review` ⇄ fix against the local branch, up to `MAX_REVIEW_ROUNDS`, ending on a review so the count is honest | `PLAN_MODEL` / `CODE_MODEL` |
-| `context` | `/update-context` against the local branch diff | `CODE_MODEL` (high) |
-| `pr` | pushes the finished branch, writes a PR description from the final diff and the spec, and opens the PR | `CODE_MODEL` (high) |
+| `spec` | `/spec-from-issue` — derives the spec, or iterates on one that already exists | `PLAN_MODEL` (high) |
+| `spec-review` | a non-interactive critique of the spec against the actual code | `PLAN_MODEL` (high) |
+| `implement` | `/implement-spec` — test-first, slice by slice | `CODE_MODEL` (medium) |
+| `techdebt` | `/techdebt` over the whole branch diff | `CODE_MODEL` (medium) |
+| `review` | `/branch-review` ⇄ fix against the local branch, up to `MAX_REVIEW_ROUNDS`, ending on a review so the count is honest | `PLAN_MODEL` (high) / `CODE_MODEL` (medium) |
+| `context` | `/update-context` against the local branch diff | `CODE_MODEL` (medium) |
+| `pr` | pushes the finished branch, writes a PR description from the final diff and the spec, and opens the PR | `CODE_MODEL` (medium) |
 
 The default loop does not open a pull request until the branch review is clean and the context update succeeds. If either step needs a human, the loop can push the branch for recovery, but it stops before creating the pull request.
 
-The `spec-review` stage does not call `/review-spec`. That skill is an interview — it stops and asks you things — and under `claude -p` an interview is not a slow run, it is a dead one. The critique is inlined in the script with the questions removed and the standards kept.
+The `spec-review` stage does not call `/review-spec`. That skill is an interview — it stops and asks you things — and in an unattended CLI process an interview is not a slow run, it is a dead one. The critique is inlined in the script with the questions removed and the standards kept.
 
 #### Setup
 
 1. Install the skills — `./install.sh`, as above. The loop calls `/spec-from-issue`, `/implement-spec`, `/techdebt`, `/branch-review`, and `/update-context`. Those skills and the inline PR-writing stages use `/clear-technical-writing` for human-facing text. Preflight checks for all six skills and warns (it does not block) if it cannot find one, so a missing skill shows up in the first ten seconds instead of an hour into a run.
-2. Copy `scripts/issue-loop.sh` and `scripts/loops-lib.sh` into your own repo, under `scripts/`. They must sit next to each other. Committing them to your repo is the simplest thing to do; if you would rather keep them untracked, add both paths to `.git/info/exclude` — **not** `.gitignore`. `.gitignore` is tracked and therefore branch-scoped, so a rule you add on `main` does not exist on the feature branch the loop is about to `git add -A` on. Preflight refuses to start unless one of the two is true.
-3. On your PATH: `claude`, `gh`, `jq`, `git`, and bash **4.2 or newer**. macOS ships bash 3.2 as `/bin/bash` — `brew install bash` and make sure it comes first, or the scripts will die on a syntax error. macOS also has no `timeout`; `brew install coreutils` gives you `gtimeout`, which the scripts find on their own. Without it a wedged stage hangs forever instead of being killed at `STAGE_TIMEOUT`.
-4. `gh auth login`, once, on the machine that will run the loop.
+2. Copy `scripts/claude-issue-loop.sh`, `scripts/codex-issue-loop.sh`, and `scripts/loops-lib.sh` into your own repo, under `scripts/`. They must sit next to each other. Committing them to your repo is the simplest thing to do; if you would rather keep them untracked, add all three paths to `.git/info/exclude` — **not** `.gitignore`. `.gitignore` is tracked and therefore branch-scoped, so a rule you add on `main` does not exist on the feature branch the loop is about to `git add -A` on. Preflight refuses to start unless one of the two is true.
+3. On your PATH: `claude` or `codex` for your chosen entrypoint, plus `gh`, `jq`, `git`, and bash **4.2 or newer**. macOS ships bash 3.2 as `/bin/bash` — `brew install bash` and make sure it comes first, or the scripts will die on a syntax error. macOS also has no `timeout`; `brew install coreutils` gives you `gtimeout`, which the scripts find on their own. Without it a wedged stage hangs forever instead of being killed at `STAGE_TIMEOUT`.
+4. Run `gh auth login` and either `claude auth login` or `codex login` on the machine that will run the loop. Codex uses its existing CLI login and checks it with `codex login status`.
 5. Optional but worth ten minutes: copy `scripts/loop-notes.example.md` to `.loop-notes.md` at your repo root and rewrite it for your project — how to build, how to run tests, which suites cannot run on this host, which toolchain is not on PATH. Every stage gets that text appended to its prompt. Without it, each stage works your build and test commands out from the repo, over and over, and sometimes gets them wrong.
 6. Start from a **clean working tree**. Preflight refuses to run dirty, and refuses to run with extra worktrees present. Which branch you are standing on does not matter — it checks out the issue's branch, or creates it from `BASE_BRANCH`; the one thing it will not do is resolve the issue's branch *to* the base branch and commit there.
 
 #### First run: always dry-run first
 
+The examples use Claude. Substitute `codex-issue-loop.sh` for `claude-issue-loop.sh` to use Codex; all flags and stages are identical. Codex prompts invoke the same installed skills with `$skill-name`.
+
 ```bash
-./scripts/issue-loop.sh <issue-number> --dry-run
+./scripts/claude-issue-loop.sh <issue-number> --dry-run
 ```
 
-This resolves the issue, works out the branch, spec path and type, prints the plan, and changes nothing — no commits, no pushes, no comments. Read it before anything real, especially to check whether it correctly found an **existing** branch and spec instead of planning to create new ones. Add `--no-adopt` if you want the dry run to be strictly free: without it, when no branch or spec matches the naming convention, one cheap read-only model call goes looking for one under a different name.
+This resolves the issue, works out the branch, spec path and type, prints the plan, and changes nothing — no commits, no pushes, no comments. Read it before anything real, especially to check whether it correctly found an **existing** branch and spec instead of planning to create new ones. Add `--no-adopt` if you want the dry run to be strictly free: without it, when no branch or spec matches the naming convention, one read-only model call goes looking for one under a different name.
 
 #### The real run
 
 ```bash
-./scripts/issue-loop.sh <issue-number>
+./scripts/claude-issue-loop.sh <issue-number>
 ```
 
 It runs in the foreground and can take hours. For anything real, detach it — tmux is strongly recommended, and non-optional on a VPS or a cloud container, where a dropped terminal otherwise kills the loop mid-edit:
 
 ```bash
-tmux new -d -s issue<N> './scripts/issue-loop.sh <N>'
+tmux new -d -s issue<N> './scripts/claude-issue-loop.sh <N>'
 tmux attach -t issue<N>     # watch it live; Ctrl-b d to detach again
 ```
 
 > [!WARNING]
-> **This is not a sandbox.** Stages run with `--permission-mode bypassPermissions`, which means no tool call will ever stop and ask you. The loop will push branches, open real PRs, label the real issue, and — in the fix rounds — file or comment on real techdebt issues in your repo. It does not merge anything, and that is the only thing it will not do. Once the dry run looks right, treat the issue number you pass it as a commitment. Run it on a machine and a repo where an agent acting on its own for a few hours is acceptable.
+> **This is not a sandbox.** Claude stages run with `--permission-mode bypassPermissions`; Codex stages use `--sandbox danger-full-access` and `approval_policy="never"`, which means no tool call will ever stop and ask you. The loop will push branches, open real PRs, label the real issue, and — in the fix rounds — file or comment on real techdebt issues in your repo. It does not merge anything, and that is the only thing it will not do. Once the dry run looks right, treat the issue number you pass it as a commitment. Run it on a machine and a repo where an agent acting on its own for a few hours is acceptable.
 
 #### Watching it run
 
@@ -143,9 +145,9 @@ tail -f .loops/latest/run.log
 | `ctx.json` | the `update-context` stage |
 | `pr.md` | PR title (line 1) + body |
 
-The `.json` files are raw `claude -p --output-format json` results — `.result`, `.total_cost_usd`, `.session_id`. The `.md` files are the readable text, pre-extracted for the spec reviews and branch reviews.
+Claude `.json` files are raw `claude -p --output-format json` results. Codex results are normalized to the same `.result` and `.is_error` fields, with `.usage` for token counts and `.session_id` for the thread ID. Codex also keeps each stage's `.events.jsonl`, `.last.txt`, and `.stderr.log` files. See the [Codex non-interactive documentation](https://developers.openai.com/codex/noninteractive/) for the event format. The `.md` files contain the extracted review text.
 
-Cost so far, at any time, without waiting for the run to finish:
+Claude cost so far, without waiting for the run to finish (Codex does not report dollar costs):
 
 ```bash
 jq -s 'map(.total_cost_usd // 0) | add' .loops/latest/*.json .loops/latest/*/*.json
@@ -176,7 +178,7 @@ The exit code determines how you resume the run:
 Every stop prints a summary block with the resume command already filled in, e.g.:
 
 ```bash
-./scripts/issue-loop.sh 19 --from implement
+./scripts/claude-issue-loop.sh 19 --from implement
 ```
 
 `--from <stage>` re-runs that stage and everything after it, reusing whatever branch and spec already exist instead of starting over. Stages: `spec`, `spec-review`, `implement`, `techdebt`, `review`, `context`, `pr`.
@@ -203,9 +205,11 @@ Everything is an environment variable with a sane default; there is no config fi
 
 | Variable | Default | What it does |
 |---|---|---|
-| `PLAN_MODEL` | `claude-opus-5` | Spec derivation, spec review, branch review |
-| `CODE_MODEL` | `claude-sonnet-5` | Implementation, techdebt, fixes, context |
-| `LOOP_AUTH` | `subscription` | Which credentials every stage bills to. `subscription` unsets `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` for the run, because `claude` prefers an exported key over your claude.ai login, and preflight then stops the run unless `claude auth status` reports subscription billing. That catches an `apiKeyHelper`, a Console login, and no login at all. Set `api-key` to bill the API key instead. |
+| `PLAN_MODEL` | Claude: `claude-opus-5-5`; Codex: `gpt-6-sol` | Spec derivation, spec review, branch review |
+| `CODE_MODEL` | Claude: `claude-opus-5-5`; Codex: `gpt-6-sol` | Implementation, techdebt, fixes, context |
+| `PLAN_EFFORT` / `CODE_EFFORT` | `high` / `medium` | Planning and review effort / implementation, fixes, cleanup, context, and PR-writing effort |
+| `ADOPT_MODEL` / `ADOPT_EFFORT` | Claude: `claude-sonnet-5` / `medium`; Codex: `gpt-6-sol` / `medium` | Read-only fallback for branches and specs with unconventional names |
+| `LOOP_AUTH` | `subscription` | Claude only: which credentials every stage bills to. `subscription` unsets `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` for the run, because `claude` prefers an exported key over your claude.ai login, and preflight then stops the run unless `claude auth status` reports subscription billing. That catches an `apiKeyHelper`, a Console login, and no login at all. Set `api-key` to bill the API key instead. |
 | `BASE_BRANCH` | `main` | What the PR targets, and what new branches are cut from. Set it to an unmerged branch to stack work on top of it. |
 | `VERSION_SEGMENT` | `v0` | The first path segment in branch and spec names |
 | `DEFAULT_TYPE` | `bugfix` | Used when labels and the title say nothing |
@@ -214,8 +218,8 @@ Everything is an environment variable with a sane default; there is no config fi
 | `STAGE_TIMEOUT` | `14400` | Seconds per stage; a wedge detector, not a pace target |
 | `MB_PER_JOB` | `2048` | RAM per build job — raise it for a heavy C++ toolchain, lower it for a light one |
 | `SUBAGENT_CAP_OVERRIDE` | measured | Concurrent subagents a stage may fan out to |
-| `STAGE_BUDGET_USD` / `TOTAL_BUDGET_USD` | `0` (off) | Cost ceilings, in dollars: per stage (passed to `claude` as `--max-budget-usd`) and per run (checked between stages, so a stage is never killed mid-edit — the run stops recoverably at exit `5`). Off by design; set them if you are on metered API billing. |
-| `PERMISSION_MODE` | `bypassPermissions` | Read the warning above before changing this to something stricter, and expect stages to stall if you do |
+| `STAGE_BUDGET_USD` / `TOTAL_BUDGET_USD` | `0` (off) | Cost ceilings, in dollars: per stage (passed to `claude` as `--max-budget-usd`) and per run (checked between stages, so a stage is never killed mid-edit — the run stops recoverably at exit `5`). Claude only. Codex rejects nonzero ceilings because it cannot enforce or report dollar costs. |
+| `PERMISSION_MODE` | `bypassPermissions` | Claude only. Codex uses `danger-full-access` with approvals disabled, except the adoption matcher, which uses `read-only`. |
 | `RUN_ROOT` | `.loops` | Where run artifacts go |
 
 The machine budget is **measured, not assumed**: cores, RAM, swap and free disk are read at startup, and the subagent cap, the build parallelism and whether worktrees are allowed are derived from them and injected into every prompt. The same script yields `-j1` and one subagent on a 4 GB VPS and more on a 32 GB workstation, with no edit.
@@ -226,7 +230,7 @@ This is the part to be deliberate about. With no human in the loop, `/spec-from-
 
 So the PR description's **"Decided without human input"** section is not boilerplate. It is the complete list of places where the loop made your call for you. Read it first, every time. If the list is long, or the spec has no `Derived decisions` section at all (the script warns when it doesn't), that is the signal the issue was underspecified — which is a problem with the issue, not the loop.
 
-Two more places the loop guesses, both of which the `--dry-run` shows you: the **type** (from labels, then the title, then `DEFAULT_TYPE`) and, when nothing matching the issue number exists, whether an off-convention branch or spec is really this issue's. The matcher for that second one is a cheap model with read-only tools, it may only return a name that is already on the list it was given, and the shell re-checks the answer against git and the filesystem before using it — a hallucinated branch name is discarded, not checked out.
+Two more places the loop guesses, both of which the `--dry-run` shows you: the **type** (from labels, then the title, then `DEFAULT_TYPE`) and, when nothing matching the issue number exists, whether an off-convention branch or spec is really this issue's. The matcher for that second one is a model with read-only tools or a read-only sandbox, it may only return a name that is already on the list it was given, and the shell re-checks the answer against git and the filesystem before using it — a hallucinated branch name is discarded, not checked out.
 
 ### Using Worktrees
 

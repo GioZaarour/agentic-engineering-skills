@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# issue-loop.sh — take ONE GitHub issue from "open" to "PR under review", unattended.
+# claude-issue-loop.sh — take ONE GitHub issue from "open" to "PR under review", unattended.
 #
-#   ./scripts/issue-loop.sh 19
-#   ./scripts/issue-loop.sh 19 --dry-run
-#   ./scripts/issue-loop.sh 19 --from implement
+#   ./scripts/claude-issue-loop.sh 19
+#   ./scripts/claude-issue-loop.sh 19 --dry-run
+#   ./scripts/claude-issue-loop.sh 19 --from implement
 #
 # One issue, one branch, one PR, start to finish, with nobody watching. It is
 # written to ADOPT whatever already exists rather than assume it is starting
@@ -25,10 +25,10 @@
 #   8. context     — /update-context against the local branch diff
 #   9. pr          — push, write a description from the final diff, open the PR
 #
-# Every stage is a separate `claude -p` process with a clean context window;
-# state moves between them through git and files on disk, never through context.
+# Every stage is a separate `claude -p` or `codex exec` process with a clean
+# context window. State moves between them through git and files on disk.
 #
-# Detached:  tmux new -d -s issue19 './scripts/issue-loop.sh 19'
+# Detached:  tmux new -d -s issue19 './scripts/claude-issue-loop.sh 19'
 #            tail -f .loops/latest/run.log
 #
 # Exit codes are load-bearing:
@@ -42,6 +42,9 @@
 # Anything project-specific — how to build, how to test — goes in .loop-notes.md.
 
 set -uo pipefail
+# Codex sources this workflow so both entrypoints run the same stages and prompts.
+LOOP_CLI="${LOOP_CLI:-claude}"
+LOOP_SCRIPT="${LOOP_CLI}-issue-loop.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./loops-lib.sh
 source "$SCRIPT_DIR/loops-lib.sh" || {
@@ -54,7 +57,8 @@ source "$SCRIPT_DIR/loops-lib.sh" || {
 # If these scripts are untracked in your repo, `git add -A` in commit_leftovers
 # would otherwise commit them into the PR being built. preflight_common skips
 # this check for a path you have committed to your own repo.
-MUST_IGNORE+=("scripts/issue-loop.sh")
+MUST_IGNORE+=("scripts/claude-issue-loop.sh")
+[[ -f "$SCRIPT_DIR/codex-issue-loop.sh" ]] && MUST_IGNORE+=("scripts/codex-issue-loop.sh")
 
 # Report the number of blocking findings that survive the LAST fix, not the one
 # the review before it counted. Worth one extra review pass here: a single-issue
@@ -65,14 +69,14 @@ FINAL_VERIFY_REVIEW="${ISSUE_LOOP_FINAL_VERIFY:-1}"
 
 STAGE_ORDER=(spec spec-review implement techdebt review context pr)
 
-# The fallback matcher (see adopt_with_agent). Cheap on purpose: it reads two
-# lists of names and picks from them, which is not work that needs a big model.
-ADOPT_MODEL="${ADOPT_MODEL:-claude-sonnet-5}"
+# The fallback matcher selects existing branches and specs from lists of names.
+# Claude uses Sonnet here; Codex uses its default model, both at medium effort.
+ADOPT_MODEL="${ADOPT_MODEL:-$DEFAULT_ADOPT_MODEL}"
 ADOPT_EFFORT="${ADOPT_EFFORT:-medium}"
 
 usage() {
-  cat <<'EOF'
-usage: ./scripts/issue-loop.sh <issue-number> [options]
+  cat <<EOF
+usage: ./scripts/${LOOP_SCRIPT} <issue-number> [options]
 
   --dry-run           resolve everything, print the plan, change nothing
   --from <stage>      run this stage and every stage after it
@@ -221,7 +225,7 @@ infer_type_from_metadata() {
 #
 # It is a SELECTOR, not a decider, and the boundary is enforced rather than
 # requested:
-#   • it gets Read/Glob/Grep and nothing that can change the repo;
+#   • it gets read-only tools (Claude) or a read-only sandbox (Codex);
 #   • it may only return a string that already appears in the list it was given;
 #   • the shell re-checks that string against git and the filesystem, and
 #     discards anything invented.
@@ -387,14 +391,14 @@ bail() {
     echo "stage:  $stage_name — $why"
     echo "branch: $BRANCH  ($(git log --oneline -1 2>/dev/null))"
     echo "logs:   $RUN_DIR"
-    printf 'cost:   $%s\n' "$(spent_usd)"
+    report_cost
     echo
     if (( USAGE_LIMIT_HIT )); then
       echo "The account spend/usage limit stopped this, not the code. When it resets:"
     else
       echo "Read $RUN_DIR/$stage_name*.json first — then resume with:"
     fi
-    echo "  ./scripts/issue-loop.sh $ISSUE --from $stage_name"
+    echo "  ./scripts/${LOOP_SCRIPT} $ISSUE --from $stage_name"
   } | tee -a "$LOG"
   exit "$code"
 }
@@ -420,10 +424,10 @@ spec_gate() {
       echo "spec:   $SPEC  (the ## BLOCKED section is at the top)"
       echo "branch: $BRANCH — pushed"
       echo "logs:   $RUN_DIR"
-      printf 'cost:   $%s\n' "$(spent_usd)"
+      report_cost
       echo
       echo "Answer it in the spec, commit, then:"
-      echo "  ./scripts/issue-loop.sh $ISSUE --from implement"
+      echo "  ./scripts/${LOOP_SCRIPT} $ISSUE --from implement"
     } | tee -a "$LOG"
     exit 3
   fi
@@ -439,7 +443,7 @@ commit_spec() {
 # ══════════════════════════════════════════════════════════════════════════
 init_run "issue-$ISSUE"
 DIR="$RUN_DIR/$ISSUE"; mkdir -p "$DIR"
-log "issue-loop #$ISSUE — stages: ${SELECTED[*]}"
+log "${LOOP_CLI}-issue-loop #$ISSUE — stages: ${SELECTED[*]}"
 
 if (( DRY_RUN )); then
   # No preflight: a dry run has to work on a dirty tree, because "what would
@@ -450,11 +454,11 @@ fi
 
 if ! (( DRY_RUN )); then
   preflight_common
-  stage "smoke test (code)" "$CODE_MODEL" "$HIGH" "Reply with the single word OK." \
+  stage "smoke test (code)" "$CODE_MODEL" "$CODE_EFFORT" "Reply with the single word OK." \
     "$RUN_DIR/smoke-code.json" || { warn "CODE_MODEL '$CODE_MODEL' failed"; exit 2; }
   # PLAN_MODEL is not used until the spec stage, so a bad name here used to
   # surface a quarter of an hour into a run instead of in preflight.
-  stage "smoke test (plan)" "$PLAN_MODEL" "$HIGH" "Reply with the single word OK." \
+  stage "smoke test (plan)" "$PLAN_MODEL" "$PLAN_EFFORT" "Reply with the single word OK." \
     "$RUN_DIR/smoke-plan.json" || { warn "PLAN_MODEL '$PLAN_MODEL' failed"; exit 2; }
   log "preflight OK"
 fi
@@ -471,7 +475,7 @@ resolve_context || { warn "cannot read issue #$ISSUE"; exit 2; }
   echo "   branch:  $BRANCH    ${FOUND_BRANCH:+(exists${ADOPT_BRANCH_SRC:+, found by $ADOPT_BRANCH_SRC})}"
   echo "   spec:    $SPEC      ${FOUND_SPEC:+(exists, $(wc -l <"$FOUND_SPEC") lines${ADOPT_SPEC_SRC:+, found by $ADOPT_SPEC_SRC})}"
   echo "   base:    $BASE_BRANCH"
-  echo "   models:  plan=$PLAN_MODEL/$XHIGH  code=$CODE_MODEL/$XHIGH"
+  echo "   models:  plan=$PLAN_MODEL/$PLAN_EFFORT  code=$CODE_MODEL/$CODE_EFFORT"
 } | tee -a "$LOG"
 
 if (( DRY_RUN )); then
@@ -569,7 +573,7 @@ EOF
 )"
   fi
 
-  stage "spec" "$PLAN_MODEL" "$XHIGH" "$SPEC_PROMPT" "$DIR/spec.json" \
+  stage "spec" "$PLAN_MODEL" "$PLAN_EFFORT" "$SPEC_PROMPT" "$DIR/spec.json" \
     || bail spec "the spec stage failed"
   [[ -s "$SPEC" ]] || bail spec "no spec was written to $SPEC"
   jq -r '.result' "$DIR/spec.json" > "$DIR/spec-msg.txt" 2>/dev/null
@@ -579,13 +583,13 @@ fi
 
 # ── 2. spec-review ────────────────────────────────────────────────────────
 # The skill this replaces (/review-spec) is an interview: it pauses after each
-# section and calls AskUserQuestion. Under `claude -p` that is not a slow run,
+# section and asks the user questions. In an unattended run that is not a slow run,
 # it is a dead one — so the critique is inlined here with the interview removed
 # and the same standards kept.
 if want spec-review && (( SPEC_REVIEW_ROUNDS > 0 )); then
   [[ -s "$SPEC" ]] || bail spec-review "no spec at $SPEC to review (run the spec stage first)"
   for r in $(seq 1 "$SPEC_REVIEW_ROUNDS"); do
-    stage "spec-review r$r" "$PLAN_MODEL" "$XHIGH" "$(cat <<EOF
+    stage "spec-review r$r" "$PLAN_MODEL" "$PLAN_EFFORT" "$(cat <<EOF
 
 Read the spec at ${SPEC}. Then re-read the issue it implements:
   gh issue view ${ISSUE} --json title,body,comments
@@ -652,7 +656,7 @@ fi
 # ── 3. implement ──────────────────────────────────────────────────────────
 if want implement; then
   [[ -s "$SPEC" ]] || bail implement "no spec at $SPEC"
-  stage "implement" "$CODE_MODEL" "$XHIGH" "$(cat <<EOF
+  stage "implement" "$CODE_MODEL" "$CODE_EFFORT" "$(cat <<EOF
 /implement-spec $SPEC
 
 ${RESOURCE_NOTE}
@@ -662,7 +666,7 @@ fi
 
 # ── 4. techdebt ───────────────────────────────────────────────────────────
 if want techdebt; then
-  stage "techdebt" "$CODE_MODEL" "$HIGH" "$(cat <<EOF
+  stage "techdebt" "$CODE_MODEL" "$CODE_EFFORT" "$(cat <<EOF
 /techdebt
 
 Scope: the whole branch since ${BASE_BRANCH} — \`git diff origin/${BASE_BRANCH}...HEAD\`.
@@ -716,7 +720,7 @@ if want pr && ! (( USAGE_LIMIT_HIT )) && (( BLOCKING == 0 )); then
   git push -u origin "$BRANCH" >>"$LOG" 2>&1 || bail pr "push failed"
   BRANCH_PUSHED=1
 
-  if ! stage "pr-body" "$CODE_MODEL" "$HIGH" "$(cat <<EOF
+  if ! stage "pr-body" "$CODE_MODEL" "$CODE_EFFORT" "$(cat <<EOF
 /clear-technical-writing
 
 Write a pull request description for branch ${BRANCH} against ${BASE_BRANCH},
@@ -796,12 +800,12 @@ fi
   echo "spec:   $SPEC"
   [[ -n "$PR_URL" ]] && echo "PR:     $PR_URL"
   echo "stages: ${SELECTED[*]}"
-  printf 'cost:   $%s\n' "$(spent_usd)"
+  report_cost
   echo "logs:   $RUN_DIR"
   echo
   if (( USAGE_LIMIT_HIT )); then
     echo "STOPPED EARLY — account spend/usage limit. Resume once it resets:"
-    echo "  ./scripts/issue-loop.sh $ISSUE --from review"
+    echo "  ./scripts/${LOOP_SCRIPT} $ISSUE --from review"
   elif (( ! REVIEWED )); then
     echo "No review ran. Nothing here has been checked by anything but the tests."
   elif (( BLOCKING > 0 )); then
@@ -809,11 +813,11 @@ fi
     echo "current diff. They are written out in full at:"
     echo "  $DIR/review-verify.md   (or review-$MAX_REVIEW_ROUNDS.md)"
     echo "Fix them on this branch, then resume with:"
-    echo "  ./scripts/issue-loop.sh $ISSUE --from review"
+    echo "  ./scripts/${LOOP_SCRIPT} $ISSUE --from review"
   elif (( BLOCKING < 0 )); then
     echo "UNVERIFIED — the review never returned a verdict. Read $DIR/review-*.md."
     echo "Resolve the review failure, then resume with:"
-    echo "  ./scripts/issue-loop.sh $ISSUE --from review"
+    echo "  ./scripts/${LOOP_SCRIPT} $ISSUE --from review"
   elif [[ -z "$PR_URL" ]]; then
     echo "Review came back clean. No PR was opened because the pr stage was not selected."
   else
