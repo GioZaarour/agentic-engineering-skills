@@ -241,10 +241,10 @@ count_other_loops() {
 # Derives this loop's share of the machine and rebuilds RESOURCE_NOTE from it.
 #
 # The running loops of this repository divide the machine evenly: LOOPS_SHARING
-# is this loop plus every other running one (or LOOPS_SHARE, when set). Within a share, build jobs
-# are split again across the agents that can build at once — the stage's agent
-# and each of its subagents runs its own `-j`, so a cap of 2 subagents at -j4 is
-# eight compile jobs, not four.
+# is this loop plus every other running one (or LOOPS_SHARE, when set). Within
+# a share, build jobs are split again across the agents that can build at once:
+# the stage's agent and each of its subagents runs its own `-j`, so the agent
+# plus 2 subagents at -j4 is twelve compile jobs, not four.
 #
 # Called at source time and again at every stage boundary (mark_stage), so a
 # loop started alone narrows its budget once others start, and widens it when
@@ -271,7 +271,7 @@ compute_budget() {
 
   jobs=$(( SHARE_MEM_MB / MB_PER_JOB ))
   (( jobs > SHARE_CORES )) && jobs=$SHARE_CORES
-  [[ "$SUBAGENT_CAP" =~ ^[0-9]+$ ]] && (( SUBAGENT_CAP > 1 )) && jobs=$(( jobs / SUBAGENT_CAP ))
+  [[ "$SUBAGENT_CAP" =~ ^[0-9]+$ ]] && jobs=$(( jobs / (SUBAGENT_CAP + 1) ))
   (( jobs < 1 )) && jobs=1
   BUILD_JOBS=${USER_BUILD_JOBS:-$jobs}
 

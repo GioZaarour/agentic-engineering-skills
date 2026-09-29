@@ -191,9 +191,9 @@ printf '%s' "$RESOURCE_NOTE"
         for (mem, cores, share), expected in {
             (3915, 2, 1): (1, 1, "no"),
             (3915, 2, 2): (1, 1, "yes"),
-            (16384, 4, 1): (2, 2, "no"),   # -j4 split across 2 subagents
-            (16384, 4, 2): (2, 1, "no"),
-            (32768, 8, 3): (2, 1, "no"),
+            (16384, 4, 1): (1, 2, "no"),   # -j4 split between the agent and 2 subagents
+            (65536, 16, 1): (5, 2, "no"),  # -j16 split three ways
+            (65536, 16, 2): (2, 2, "no"),
         }.items():
             with self.subTest(mem=mem, cores=cores, share=share):
                 b = self.budget(mem, cores, LOOPS_SHARE=str(share))
@@ -514,11 +514,26 @@ commit_leftovers "rejected"
         (self.bin / "systemctl").write_text("#!/bin/sh\nexit 1\n")   # no user instance to reach
         result = self.run_cmd(BASH, "scripts/loops", "run", "19", LOOPS_CGROUP="on")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("needs systemd-run and a user systemd instance", result.stderr)
+        self.assertIn("no systemd-run or user systemd instance", result.stderr)
         self.assertFalse((self.root / "repo-loops/issue-19").exists())
         result = self.run_cmd(BASH, "scripts/loops", "run", "19", LOOPS_CGROUP="auto")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("without a shared memory ceiling", result.stdout)
+        tmux = json.loads(Path(self.env["CALLS"] + ".tmux").read_text().splitlines()[-1])
+        self.assertNotIn("systemd-run", tmux[-1])
+
+    def test_loops_run_when_the_memory_ceiling_cannot_be_set(self):
+        self.add_remote()
+        self.fake_systemd()
+        (self.bin / "systemctl").write_text(          # reachable, but set-property is refused
+            '#!/bin/sh\n[ "$2" = set-property ] && exit 1\nexit 0\n')
+        result = self.run_cmd(BASH, "scripts/loops", "run", "19", LOOPS_CGROUP="on")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("cannot set MemoryMax", result.stderr)
+        self.assertFalse((self.root / "repo-loops/issue-19").exists())
+        result = self.run_cmd(BASH, "scripts/loops", "run", "19", LOOPS_CGROUP="auto")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("cannot set MemoryMax", result.stdout)
         tmux = json.loads(Path(self.env["CALLS"] + ".tmux").read_text().splitlines()[-1])
         self.assertNotIn("systemd-run", tmux[-1])
 
