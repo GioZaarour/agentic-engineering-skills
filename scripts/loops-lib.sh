@@ -63,7 +63,7 @@ case "$LOOP_CLI" in
     esac
     ;;
   codex)
-    DEFAULT_MODEL=gpt-6-sol
+    DEFAULT_MODEL=gpt-6.1-sol
     DEFAULT_ADOPT_MODEL=gpt-6-luna
     ;;
   *) echo "unknown loop CLI: $LOOP_CLI" >&2; exit 2 ;;

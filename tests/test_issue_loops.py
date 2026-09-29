@@ -169,7 +169,7 @@ exit "$rc"
 
     def test_defaults_and_overrides(self):
         code = 'printf "%s %s %s %s" "$PLAN_MODEL" "$PLAN_EFFORT" "$CODE_MODEL" "$CODE_EFFORT"'
-        for cli, model in (("claude", "claude-opus-5-5"), ("codex", "gpt-6-sol")):
+        for cli, model in (("claude", "claude-opus-5-5"), ("codex", "gpt-6.1-sol")):
             with self.subTest(cli=cli):
                 self.assertEqual(self.shell(code, LOOP_CLI=cli).stdout, f"{model} high {model} medium")
                 self.assertEqual(self.shell(code, LOOP_CLI=cli, PLAN_MODEL="plan", CODE_MODEL="code",
@@ -285,7 +285,7 @@ printf '%s' "$RESOURCE_NOTE"
         self.assertIn("does not support", result.stderr)
 
     def test_help_and_dry_run(self):
-        for cli, model in (("claude", "claude-opus-5-5"), ("codex", "gpt-6-sol")):
+        for cli, model in (("claude", "claude-opus-5-5"), ("codex", "gpt-6.1-sol")):
             script = f"scripts/{cli}-issue-loop.sh"
             result = self.run_cmd(BASH, script, "--help")
             self.assertEqual(result.returncode, 0, result.stderr)

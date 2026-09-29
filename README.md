@@ -205,8 +205,8 @@ Everything is an environment variable with a sane default; there is no config fi
 
 | Variable | Default | What it does |
 |---|---|---|
-| `PLAN_MODEL` | Claude: `claude-opus-5-5`; Codex: `gpt-6-sol` | Spec derivation, spec review, branch review |
-| `CODE_MODEL` | Claude: `claude-opus-5-5`; Codex: `gpt-6-sol` | Implementation, techdebt, fixes, context |
+| `PLAN_MODEL` | Claude: `claude-opus-5-5`; Codex: `gpt-6.1-sol` | Spec derivation, spec review, branch review |
+| `CODE_MODEL` | Claude: `claude-opus-5-5`; Codex: `gpt-6.1-sol` | Implementation, techdebt, fixes, context |
 | `PLAN_EFFORT` / `CODE_EFFORT` | `high` / `medium` | Planning and review effort / implementation, fixes, cleanup, context, and PR-writing effort |
 | `ADOPT_MODEL` / `ADOPT_EFFORT` | Claude: `claude-haiku-4-5-20251001` / unset; Codex: `gpt-6-luna` / `medium` | Read-only fallback for branches and specs with unconventional names. Haiku does not support the effort flag. |
 | `LOOP_AUTH` | `subscription` | Claude only: which credentials every stage bills to. `subscription` unsets `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` for the run, because `claude` prefers an exported key over your claude.ai login, and preflight then stops the run unless `claude auth status` reports subscription billing. That catches an `apiKeyHelper`, a Console login, and no login at all. Set `api-key` to bill the API key instead. |
