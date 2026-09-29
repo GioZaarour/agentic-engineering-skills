@@ -116,7 +116,8 @@ class IssueLoopTests(unittest.TestCase):
         for key in ("PLAN_MODEL", "CODE_MODEL", "PLAN_EFFORT", "CODE_EFFORT", "LOOP_CLI",
                     "STAGE_BUDGET_USD", "TOTAL_BUDGET_USD", "FAKE_MODE", "LOOPS_SHARE",
                     "BUILD_JOBS", "SUBAGENT_CAP_OVERRIDE", "ALLOW_WORKTREES_OVERRIDE", "MB_PER_JOB",
-                    "LOOPS_MEMORY_MAX", "LOOPS_MEMORY_RESERVE_MB", "LOOPS_SLICE"):
+                    "LOOPS_MEMORY_MAX", "LOOPS_MEMORY_RESERVE_MB", "LOOPS_SLICE",
+                    "LOOPS_WORKTREE_PARENT", "LOOPS_WORKTREE_ROOT"):
             self.env.pop(key, None)
         self.git("init", "-q", "-b", "main")
         self.git("config", "user.name", "Loop Test")
@@ -565,6 +566,26 @@ commit_leftovers "rejected"
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         call = json.loads(Path(self.env["CALLS"] + ".tmux").read_text().splitlines()[-1])
         self.assertEqual(Path(call[5]).resolve(), (self.root / "repo-loops/issue-19").resolve())
+
+
+    def test_loops_run_puts_worktrees_under_the_configured_parent(self):
+        self.add_remote()
+        parent = self.root / "volume"
+        result = self.run_cmd(BASH, "scripts/loops", "run", "19", LOOPS_WORKTREE_PARENT=str(parent))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        call = json.loads(Path(self.env["CALLS"] + ".tmux").read_text().splitlines()[-1])
+        self.assertEqual(Path(call[5]).resolve(), (parent / "repo-loops/issue-19").resolve())
+        self.assertFalse((self.root / "repo-loops").exists())
+
+    def test_loops_worktree_root_takes_precedence_over_the_parent(self):
+        self.add_remote()
+        root = self.root / "exact"
+        result = self.run_cmd(BASH, "scripts/loops", "run", "19",
+                              LOOPS_WORKTREE_PARENT=str(self.root / "volume"), LOOPS_WORKTREE_ROOT=str(root))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        call = json.loads(Path(self.env["CALLS"] + ".tmux").read_text().splitlines()[-1])
+        self.assertEqual(Path(call[5]).resolve(), (root / "issue-19").resolve())
+        self.assertFalse((self.root / "volume").exists())
 
 
 if __name__ == "__main__":
