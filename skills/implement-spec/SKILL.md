@@ -25,6 +25,8 @@ Every slice — including a single-slice spec — runs this loop before its comm
 
 Read the slice dependency graph as a wavefront. Whenever two or more slices have no unmet dependency on each other, hand them to **subagents that run concurrently** (spawn them in one message) — you orchestrate and integrate. Give **each parallel subagent its own git worktree** so their diffs don't collide. Each subagent owns its full per-slice loop (tests → implement → document → techdebt → commit). Serialize only slices that genuinely depend on prior work; never idle a lane waiting on an unrelated one. After parallel slices land, integrate them, resolve conflicts, and rerun the affected tests on the merged tree.
 
+Follow any machine budget your caller supplies. It overrides the fan-out above: run no more subagents at once than its cap, and when it says worktrees are not allowed, give no subagent its own worktree. Work the slices one at a time in the current tree instead. A worktree that builds needs its own copy of every build artifact, and each concurrent build needs its own share of RAM.
+
 ## Done
 
 A **slice** is done when its tests are green, the code is documented, techdebt is clean, and a focused commit has landed.

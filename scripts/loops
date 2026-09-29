@@ -10,6 +10,9 @@
 # Each loop records its progress in <git common dir>/loops/<run-id>.json (see
 # write_status in loops-lib.sh). That directory is shared by every worktree, so
 # this command finds every run without knowing where its worktree is.
+#
+# Where a user systemd instance exists (most Linux hosts), every loop runs in
+# one shared slice with a memory ceiling — see contain_memory.
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,6 +22,10 @@ MAIN_ROOT="$(dirname "$COMMON_DIR")"
 REPO_NAME="$(basename "$MAIN_ROOT")"
 BASE_BRANCH="${BASE_BRANCH:-main}"
 WORKTREE_ROOT="${LOOPS_WORKTREE_ROOT:-$(dirname "$MAIN_ROOT")/$REPO_NAME-loops}"
+LOOPS_CGROUP="${LOOPS_CGROUP:-auto}"                      # auto | on | off
+LOOPS_SLICE="${LOOPS_SLICE:-loops.slice}"
+LOOPS_MEMORY_RESERVE_MB="${LOOPS_MEMORY_RESERVE_MB:-1024}"
+LOOPS_MEMORY_MAX="${LOOPS_MEMORY_MAX:-}"                  # systemd size, e.g. 12G; default: RAM minus the reserve
 
 usage() {
   sed -n '6,8p' "${BASH_SOURCE[0]}" | sed 's/^# //'
@@ -69,12 +76,64 @@ cmd_status() {
   done < <(runs "$all")
 }
 
+# ── contain_memory ────────────────────────────────────────────────────────
+# Puts every loop into one systemd slice whose MemoryMax is the machine's RAM
+# minus LOOPS_MEMORY_RESERVE_MB, by filling the `wrap` array the tmux command is
+# prefixed with. The slice is shared by all loops on the machine, including
+# loops of other repositories, because the limit protects the machine, not one
+# repository.
+#
+# The budget in loops-lib.sh is what keeps loops inside their share, but it is
+# an instruction in a prompt and an agent can ignore it. Without a slice, the
+# kernel's OOM killer then picks the largest process on the machine, which can
+# be your interactive session or the tmux server holding every loop. With one,
+# it picks inside the slice: a compiler or one loop's agent, and that loop stops
+# recoverably.
+#
+# auto uses the slice when it can be set up, and otherwise runs the loops
+# uncontained with a note. on refuses to start without it. off never uses it.
+contain_memory() {
+  local mem_mb limit
+  wrap=()
+  [[ "$LOOPS_CGROUP" == off ]] && return 0
+  [[ "$LOOPS_CGROUP" == auto || "$LOOPS_CGROUP" == on ]] \
+    || { echo "LOOPS_CGROUP must be auto, on or off" >&2; return 2; }
+  if ! command -v systemd-run >/dev/null || ! systemctl --user show-environment >/dev/null 2>&1; then
+    uncontained "no systemd-run or user systemd instance to put the loops in"
+    return
+  fi
+  limit="$LOOPS_MEMORY_MAX"
+  if [[ -z "$limit" ]]; then
+    mem_mb=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)
+    if ! [[ "$mem_mb" =~ ^[0-9]+$ && "$LOOPS_MEMORY_RESERVE_MB" =~ ^[0-9]+$ ]] \
+       || (( mem_mb <= LOOPS_MEMORY_RESERVE_MB )); then
+      uncontained "cannot size the memory ceiling from ${mem_mb:-unknown} MB RAM and a" \
+                  "${LOOPS_MEMORY_RESERVE_MB} MB reserve — set LOOPS_MEMORY_MAX"
+      return
+    fi
+    limit="$(( mem_mb - LOOPS_MEMORY_RESERVE_MB ))M"
+  fi
+  if ! systemctl --user set-property --runtime "$LOOPS_SLICE" "MemoryMax=$limit"; then
+    uncontained "cannot set MemoryMax=$limit on $LOOPS_SLICE"
+    return
+  fi
+  wrap=(systemd-run --user --scope --quiet "--slice=$LOOPS_SLICE" --)
+  echo "memory: loops share $LOOPS_SLICE, MemoryMax=$limit"
+}
+
+# The slice cannot be used. Under LOOPS_CGROUP=on that stops the command (2);
+# under auto the loops start without it (0), and the reason is printed.
+uncontained() {
+  if [[ "$LOOPS_CGROUP" == on ]]; then echo "$*" >&2; return 2; fi
+  echo "memory: $* — loops run without a shared memory ceiling"
+}
+
 # A numbered issue branch in the invoking checkout is an explicit choice to
 # work there. All other runs use the issue's dedicated worktree, including runs
 # whose older status record points at an unrelated checkout.
 cmd_run() {
   local cli=claude n wt session rc=0 var current_root current_branch tmux_version tmux_major tmux_minor
-  local -a issues=() pass=() env_args=()
+  local -a issues=() pass=() env_args=() wrap=()
   while (( $# )); do
     case "$1" in
       --cli) cli="$2"; shift 2 ;;
@@ -106,6 +165,7 @@ cmd_run() {
     [[ "$var" != TMUX && -n "${!var+x}" ]] && env_args+=(-e "$var=${!var}")
   done
 
+  contain_memory || return 2
   git fetch -q origin || { echo "cannot fetch origin" >&2; return 2; }
   for n in "${issues[@]}"; do
     session="${REPO_NAME//[.:]/_}-$n"
@@ -126,7 +186,7 @@ cmd_run() {
       fi
     fi
     tmux new-session -d -s "$session" -c "$wt" "${env_args[@]}" \
-      "$(printf '%q ' "$SCRIPT_DIR/$cli-issue-loop.sh" "$n" ${pass[@]+"${pass[@]}"})" \
+      "$(printf '%q ' ${wrap[@]+"${wrap[@]}"} "$SCRIPT_DIR/$cli-issue-loop.sh" "$n" ${pass[@]+"${pass[@]}"})" \
       || { rc=1; continue; }
     echo "#$n started in $wt — tmux attach -t $session"
   done

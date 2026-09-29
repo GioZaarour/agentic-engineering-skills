@@ -75,6 +75,14 @@ if sys.argv[1:3] == ['pr', 'view']:
     print('https://example.invalid/pr/42' if sys.argv[-1] == '.url' else '42')
 '''
 
+# Records every call; `systemctl --user show-environment` succeeds, as it does
+# on a host with a user systemd instance.
+FAKE_SYSTEMD = r'''#!/usr/bin/env python3
+import json, os, pathlib, sys
+with open(os.environ['CALLS'] + '.systemd', 'a') as f:
+    f.write(json.dumps([pathlib.Path(sys.argv[0]).name] + sys.argv[1:]) + '\n')
+'''
+
 FAKE_TMUX = r'''#!/usr/bin/env python3
 import json, os, sys
 if sys.argv[1:] == ['-V']:
@@ -103,9 +111,12 @@ class IssueLoopTests(unittest.TestCase):
             path.chmod(0o755)
         self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
                         CALLS=str(self.root / "calls.jsonl"), MAX_ATTEMPTS="1", MIN_DISK_GB="0",
-                        GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+                        GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                        LOOPS_CGROUP="off")
         for key in ("PLAN_MODEL", "CODE_MODEL", "PLAN_EFFORT", "CODE_EFFORT", "LOOP_CLI",
-                    "STAGE_BUDGET_USD", "TOTAL_BUDGET_USD", "FAKE_MODE"):
+                    "STAGE_BUDGET_USD", "TOTAL_BUDGET_USD", "FAKE_MODE", "LOOPS_SHARE",
+                    "BUILD_JOBS", "SUBAGENT_CAP_OVERRIDE", "ALLOW_WORKTREES_OVERRIDE", "MB_PER_JOB",
+                    "LOOPS_MEMORY_MAX", "LOOPS_MEMORY_RESERVE_MB", "LOOPS_SLICE"):
             self.env.pop(key, None)
         self.git("init", "-q", "-b", "main")
         self.git("config", "user.name", "Loop Test")
@@ -163,6 +174,49 @@ exit "$rc"
                 self.assertEqual(self.shell(code, LOOP_CLI=cli, PLAN_MODEL="plan", CODE_MODEL="code",
                                             PLAN_EFFORT="medium", CODE_EFFORT="low").stdout,
                                  "plan medium code low")
+
+    def budget(self, mem_mb, cores, **env):
+        """The derived budget for a host of the given size, as a dict."""
+        out = self.shell(f'''
+MEM_TOTAL_MB={mem_mb}; CORES={cores}; compute_budget
+printf '%s\\n' "$LOOPS_SHARING" "$BUILD_JOBS" "$SUBAGENT_CAP" "$ALLOW_WORKTREES" "$SHARE_BELOW_ONE_JOB"
+printf '%s' "$RESOURCE_NOTE"
+''', **env).stdout
+        sharing, jobs, cap, worktrees, below, note = out.split("\n", 5)
+        return dict(sharing=int(sharing), jobs=int(jobs), cap=int(cap), worktrees=worktrees,
+                    below=below, note=note)
+
+    def test_budget_divides_the_host_between_loops(self):
+        # (RAM MB, cores, loops) -> (jobs per agent, subagents, below one job)
+        for (mem, cores, share), expected in {
+            (3915, 2, 1): (1, 1, "no"),
+            (3915, 2, 2): (1, 1, "yes"),
+            (16384, 4, 1): (1, 2, "no"),   # -j4 split between the agent and 2 subagents
+            (65536, 16, 1): (5, 2, "no"),  # -j16 split three ways
+            (65536, 16, 2): (2, 2, "no"),
+        }.items():
+            with self.subTest(mem=mem, cores=cores, share=share):
+                b = self.budget(mem, cores, LOOPS_SHARE=str(share))
+                self.assertEqual((b["jobs"], b["cap"], b["below"]), expected)
+                self.assertEqual(b["sharing"], share)
+                self.assertIn(f"at {b['jobs']} job(s) per agent", b["note"])
+                self.assertEqual(f"{share} issue loops share this host" in b["note"], share > 1)
+                self.assertEqual("smaller than one build job" in b["note"], expected[2] == "yes")
+
+    def test_budget_counts_only_live_running_loops(self):
+        sleeper = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(sleeper.wait)
+        self.addCleanup(sleeper.kill)
+        self.write_status("1-issue-21", issue=21, pid=sleeper.pid)
+        self.write_status("2-issue-22", issue=22, pid=2**22 + 1)            # died
+        self.write_status("3-issue-23", issue=23, state="done", pid=sleeper.pid)
+        self.assertEqual(self.budget(16384, 4)["sharing"], 2)
+        self.assertEqual(self.budget(16384, 4, LOOPS_SHARE="5")["sharing"], 5)
+
+    def test_pinned_budget_survives_recomputation(self):
+        b = self.budget(3915, 2, LOOPS_SHARE="4", BUILD_JOBS="3", SUBAGENT_CAP_OVERRIDE="2",
+                        ALLOW_WORKTREES_OVERRIDE="yes")
+        self.assertEqual((b["jobs"], b["cap"], b["worktrees"]), (3, 2, "yes"))
 
     def test_adoption_uses_small_models(self):
         for cli, model in (("claude", "claude-haiku-4-5-20251001"),
@@ -430,6 +484,58 @@ commit_leftovers "rejected"
         self.assertRegex(new19[-1], r"codex-issue-loop\.sh 19 --no-push\s*$")
         self.assertEqual(Path(new24[5]).resolve(), other.resolve())
         self.assertFalse((self.root / "repo-loops/issue-21").exists())
+
+    def fake_systemd(self):
+        for name in ("systemd-run", "systemctl"):
+            path = self.bin / name
+            path.write_text(FAKE_SYSTEMD)
+            path.chmod(0o755)
+
+    def test_loops_run_contains_every_loop_in_one_memory_slice(self):
+        self.add_remote()
+        self.fake_systemd()
+        for env, limit in (({}, None), ({"LOOPS_MEMORY_MAX": "6G"}, "6G")):
+            with self.subTest(**env):
+                for suffix in (".systemd", ".tmux"):
+                    Path(self.env["CALLS"] + suffix).unlink(missing_ok=True)
+                result = self.run_cmd(BASH, "scripts/loops", "run", "19", LOOPS_CGROUP="auto", **env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                systemd = [json.loads(l) for l in Path(self.env["CALLS"] + ".systemd").read_text().splitlines()]
+                prop = next(c for c in systemd if "set-property" in c)
+                self.assertEqual(prop[:5], ["systemctl", "--user", "set-property", "--runtime", "loops.slice"])
+                self.assertRegex(prop[5], r"^MemoryMax=\d+M$" if limit is None else f"^MemoryMax={limit}$")
+                tmux = json.loads(Path(self.env["CALLS"] + ".tmux").read_text().splitlines()[-1])
+                self.assertRegex(tmux[-1], r"^systemd-run --user --scope --quiet --slice=loops\.slice -- "
+                                           r"\S+/claude-issue-loop\.sh 19\s*$")
+
+    def test_loops_run_without_a_user_systemd_instance(self):
+        self.add_remote()
+        self.fake_systemd()
+        (self.bin / "systemctl").write_text("#!/bin/sh\nexit 1\n")   # no user instance to reach
+        result = self.run_cmd(BASH, "scripts/loops", "run", "19", LOOPS_CGROUP="on")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("no systemd-run or user systemd instance", result.stderr)
+        self.assertFalse((self.root / "repo-loops/issue-19").exists())
+        result = self.run_cmd(BASH, "scripts/loops", "run", "19", LOOPS_CGROUP="auto")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("without a shared memory ceiling", result.stdout)
+        tmux = json.loads(Path(self.env["CALLS"] + ".tmux").read_text().splitlines()[-1])
+        self.assertNotIn("systemd-run", tmux[-1])
+
+    def test_loops_run_when_the_memory_ceiling_cannot_be_set(self):
+        self.add_remote()
+        self.fake_systemd()
+        (self.bin / "systemctl").write_text(          # reachable, but set-property is refused
+            '#!/bin/sh\n[ "$2" = set-property ] && exit 1\nexit 0\n')
+        result = self.run_cmd(BASH, "scripts/loops", "run", "19", LOOPS_CGROUP="on")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("cannot set MemoryMax", result.stderr)
+        self.assertFalse((self.root / "repo-loops/issue-19").exists())
+        result = self.run_cmd(BASH, "scripts/loops", "run", "19", LOOPS_CGROUP="auto")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("cannot set MemoryMax", result.stdout)
+        tmux = json.loads(Path(self.env["CALLS"] + ".tmux").read_text().splitlines()[-1])
+        self.assertNotIn("systemd-run", tmux[-1])
 
     def test_loops_run_rejects_tmux_before_creating_worktrees(self):
         for version in ("tmux 3.0", "tmux 3.1c", "unknown"):
