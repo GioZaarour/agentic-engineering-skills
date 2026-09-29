@@ -193,12 +193,25 @@ find_issue_branch() {
 # when any start path is missing, and under pipefail that reads as "no spec"
 # rather than "no specs/ directory". nullglob makes an unmatched pattern vanish
 # instead of arriving as a literal filename.
+#
+# $1 is the issue's branch. A spec usually exists only on that branch, and it is
+# not checked out until sync — `loops run` starts every worktree from the base
+# branch — so a working-tree miss falls through to that branch's tree. The hit is
+# tested by emptiness, not exit status: under pipefail a SIGPIPE'd ls-tree would
+# read as "no spec".
 find_issue_spec() {
-  local hits=()
+  local hits=() ref spec
   shopt -s nullglob
   hits=( specs/*/*/"$ISSUE"[-_]*.md specs/*/"$ISSUE"[-_]*.md )
   shopt -u nullglob
-  (( ${#hits[@]} )) && printf '%s\n' "${hits[0]}"
+  (( ${#hits[@]} )) && { printf '%s\n' "${hits[0]}"; return 0; }
+  [[ -n "${1:-}" ]] || return 0
+  for ref in "$1" "origin/$1"; do
+    spec=$(git ls-tree -r --name-only "$ref" -- specs 2>/dev/null \
+           | grep -E "^specs/([^/]+/){1,2}${ISSUE}[-_][^/]*\.md$")
+    [[ -n "$spec" ]] && { printf '%s\n' "${spec%%$'\n'*}"; return 0; }
+  done
+  return 0
 }
 
 # `v0/feature/19-ui` → v0 feature. Also reads `specs/v0/feature/19-ui.md`.
@@ -341,7 +354,7 @@ resolve_context() {
   SLUG=$(slugify "$TITLE")
 
   FOUND_BRANCH=$(find_issue_branch)
-  FOUND_SPEC=$(find_issue_spec)
+  FOUND_SPEC=$(find_issue_spec "${BRANCH_FLAG:-$FOUND_BRANCH}")
   ADOPT_BRANCH_SRC=""; ADOPT_SPEC_SRC=""
 
   # Provisional, so the matcher can be shown what the convention would produce.
@@ -494,7 +507,7 @@ resolve_context || { warn "cannot read issue #$ISSUE"; exit 2; }
   echo "   type:    $TYPE      (from $TYPE_SRC)"
   echo "   version: $VERSION   (from $VERSION_SRC)"
   echo "   branch:  $BRANCH    ${FOUND_BRANCH:+(exists${ADOPT_BRANCH_SRC:+, found by $ADOPT_BRANCH_SRC})}"
-  echo "   spec:    $SPEC      ${FOUND_SPEC:+(exists, $(wc -l <"$FOUND_SPEC") lines${ADOPT_SPEC_SRC:+, found by $ADOPT_SPEC_SRC})}"
+  echo "   spec:    $SPEC      ${FOUND_SPEC:+(exists, $([[ -f "$FOUND_SPEC" ]] && echo "$(wc -l <"$FOUND_SPEC") lines" || echo "on $BRANCH")${ADOPT_SPEC_SRC:+, found by $ADOPT_SPEC_SRC})}"
   echo "   base:    $BASE_BRANCH"
   echo "   models:  plan=$PLAN_MODEL/$PLAN_EFFORT  code=$CODE_MODEL/$CODE_EFFORT"
 } | tee -a "$LOG"

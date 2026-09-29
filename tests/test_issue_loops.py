@@ -296,6 +296,25 @@ printf '%s' "$RESOURCE_NOTE"
             self.assertIn("Stages that would run: review context pr", result.stdout)
         self.assertEqual(self.calls(), [])
 
+    def test_spec_on_unchecked_out_issue_branch_is_adopted(self):
+        # `loops run` starts each worktree from main, so a spec committed only on
+        # the issue's branch is not on disk when the loop resolves the spec path.
+        self.add_remote()
+        self.git("checkout", "-qb", "v0/feature/19-short")
+        spec = self.repo / "specs/v0/feature/19-short.md"
+        spec.parent.mkdir(parents=True)
+        spec.write_text("# Spec\n")
+        self.git("add", "specs")
+        self.git("commit", "-qm", "spec")
+        self.git("push", "-qu", "origin", "v0/feature/19-short")
+        self.git("checkout", "-q", "main")
+        result = self.run_cmd(BASH, "scripts/claude-issue-loop.sh", "19", "--no-adopt",
+                              "--no-push", "--stages", "implement")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("(exists, on v0/feature/19-short)", result.stdout)
+        implement = [c["prompt"] for c in self.calls() if c["prompt"].startswith("/implement-spec")]
+        self.assertIn("specs/v0/feature/19-short.md", implement[0])
+
     def test_full_local_workflow_uses_phase_efforts(self):
         self.add_remote()
         for cli in ("claude", "codex"):
