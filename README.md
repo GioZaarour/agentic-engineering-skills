@@ -242,7 +242,7 @@ The loops do not coordinate with each other. Choose issues that change separate 
 
 - Complete the loop [Setup](#setup) first. The parallel command uses the same scripts, logins, and skills.
 - Copy `scripts/loops` next to the other three scripts.
-- Install tmux 3.0 or newer and git 2.31 or newer.
+- Install tmux 3.2 or newer and git 2.31 or newer. The launcher checks the tmux version before starting any runs.
 
 #### Start loops
 

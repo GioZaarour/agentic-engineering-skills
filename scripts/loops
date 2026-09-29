@@ -73,7 +73,7 @@ cmd_status() {
 # work there. All other runs use the issue's dedicated worktree, including runs
 # whose older status record points at an unrelated checkout.
 cmd_run() {
-  local cli=claude n wt session rc=0 var current_root current_branch
+  local cli=claude n wt session rc=0 var current_root current_branch tmux_version tmux_major tmux_minor
   local -a issues=() pass=() env_args=()
   while (( $# )); do
     case "$1" in
@@ -86,6 +86,15 @@ cmd_run() {
   [[ "$cli" == claude || "$cli" == codex ]] || { echo "--cli must be claude or codex" >&2; return 2; }
   (( ${#issues[@]} )) || { usage >&2; return 2; }
   command -v tmux >/dev/null || { echo "tmux is required" >&2; return 2; }
+  tmux_version=$(tmux -V) || { echo "cannot determine tmux version" >&2; return 2; }
+  if [[ ! "$tmux_version" =~ ^tmux[[:space:]]+([0-9]+)\.([0-9]+) ]]; then
+    echo "cannot parse tmux version: $tmux_version" >&2; return 2
+  fi
+  tmux_major=$((10#${BASH_REMATCH[1]}))
+  tmux_minor=$((10#${BASH_REMATCH[2]}))
+  if (( tmux_major < 3 || (tmux_major == 3 && tmux_minor < 2) )); then
+    echo "tmux 3.2 or newer is required (found $tmux_version)" >&2; return 2
+  fi
   current_root="$(git rev-parse --show-toplevel)" || return 2
   current_branch="$(git branch --show-current)" || return 2
 

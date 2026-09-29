@@ -77,6 +77,9 @@ if sys.argv[1:3] == ['pr', 'view']:
 
 FAKE_TMUX = r'''#!/usr/bin/env python3
 import json, os, sys
+if sys.argv[1:] == ['-V']:
+    print(os.environ.get('FAKE_TMUX_VERSION', 'tmux 3.2'))
+    sys.exit(0)
 if sys.argv[1] == 'has-session':
     sys.exit(0 if sys.argv[-1] == '=repo-21' else 1)
 with open(os.environ['CALLS'] + '.tmux', 'a') as f:
@@ -427,6 +430,17 @@ commit_leftovers "rejected"
         self.assertRegex(new19[-1], r"codex-issue-loop\.sh 19 --no-push\s*$")
         self.assertEqual(Path(new24[5]).resolve(), other.resolve())
         self.assertFalse((self.root / "repo-loops/issue-21").exists())
+
+    def test_loops_run_rejects_tmux_before_creating_worktrees(self):
+        for version in ("tmux 3.0", "tmux 3.1c", "unknown"):
+            with self.subTest(version=version):
+                result = self.run_cmd(BASH, "scripts/loops", "run", "19",
+                                      FAKE_TMUX_VERSION=version)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("tmux version" if version == "unknown" else "tmux 3.2 or newer",
+                              result.stderr)
+                self.assertFalse((self.root / "repo-loops/issue-19").exists())
+                self.assertFalse(Path(self.env["CALLS"] + ".tmux").exists())
 
     def test_loops_run_uses_current_checkout_only_for_matching_issue_branch(self):
         self.add_remote()
