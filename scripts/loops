@@ -21,7 +21,12 @@ REGISTRY="$COMMON_DIR/loops"
 MAIN_ROOT="$(dirname "$COMMON_DIR")"
 REPO_NAME="$(basename "$MAIN_ROOT")"
 BASE_BRANCH="${BASE_BRANCH:-main}"
-WORKTREE_ROOT="${LOOPS_WORKTREE_ROOT:-$(dirname "$MAIN_ROOT")/$REPO_NAME-loops}"
+# Dedicated worktrees go in <parent>/<repo>-loops/issue-<N>. Setting only the
+# parent lets one exported value serve every repository: each still gets its own
+# <repo>-loops folder, so issue numbers from two repositories never collide.
+# LOOPS_WORKTREE_ROOT names the folder itself and wins when both are set.
+LOOPS_WORKTREE_PARENT="${LOOPS_WORKTREE_PARENT:-$(dirname "$MAIN_ROOT")}"
+WORKTREE_ROOT="${LOOPS_WORKTREE_ROOT:-$LOOPS_WORKTREE_PARENT/$REPO_NAME-loops}"
 LOOPS_CGROUP="${LOOPS_CGROUP:-auto}"                      # auto | on | off
 LOOPS_SLICE="${LOOPS_SLICE:-loops.slice}"
 LOOPS_MEMORY_RESERVE_MB="${LOOPS_MEMORY_RESERVE_MB:-1024}"

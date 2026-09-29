@@ -266,7 +266,7 @@ PLAN_MODEL=claude-fable-5-1 ./scripts/loops run 30 31   # settings apply to ever
 For each issue number, `loops run` does the following:
 
 1. It names the tmux session `<repo>-<N>`, for example `myapp-19`. If a session with that name exists, it skips the issue and prints the `tmux attach` command.
-2. It checks the branch in the invoking checkout. If it matches the issue number, the loop runs there. Otherwise it uses `../<repo>-loops/issue-<N>`, reusing that dedicated worktree if it exists or creating it detached at `origin/<BASE_BRANCH>`. Earlier status records do not select a checkout. Set `LOOPS_WORKTREE_ROOT` to put dedicated worktrees somewhere else.
+2. It checks the branch in the invoking checkout. If it matches the issue number, the loop runs there. Otherwise it uses `../<repo>-loops/issue-<N>`, reusing that dedicated worktree if it exists or creating it detached at `origin/<BASE_BRANCH>`. Earlier status records do not select a checkout. To put dedicated worktrees somewhere else, such as a separate disk, set `LOOPS_WORKTREE_PARENT`: worktrees then go in `<parent>/<repo>-loops/issue-<N>`. Every repository gets its own folder there, so one value in your shell profile serves all of them. `LOOPS_WORKTREE_ROOT` names the folder for one repository directly and takes precedence. Two repositories whose checkouts have the same directory name would share a folder; `loops run` then refuses the second repository's worktree rather than reuse the first's.
 3. It starts `<cli>-issue-loop.sh <N>` in the new session, inside the selected checkout. The loop then creates or adopts the issue's branch, exactly as a single run does.
 
 Some details affect how you call it:
@@ -359,7 +359,7 @@ Parallel loops share the machine, the git repository, and your accounts. They di
 - **Disk:** Each worktree holds its own build artifacts. Each loop checks `MIN_DISK_GB` once, at its own start, against the free disk at that time. Its share of free disk is re-measured at every stage boundary and decides whether its stages may create worktrees. Set `ALLOW_WORKTREES_OVERRIDE=no` when disk is limited.
 - **Usage limits:** All Claude loops draw on the same subscription. All Codex loops draw on the same Codex account. When one loop reaches the limit, the others usually reach it soon after. When the limit resets, resume each `limit` loop from `status`.
 - **Branches:** git checks out a branch in only one worktree at a time. If the issue branch is checked out in another checkout, run `loops` from that checkout or switch it to another branch before starting the dedicated worktree.
-- **Worktree location:** Preflight refuses to start when a worktree is nested inside the loop's checkout, because `git add -A` would commit it as an embedded repository. The default location, `../<repo>-loops/`, is outside the checkout. Keep `LOOPS_WORKTREE_ROOT` outside it too.
+- **Worktree location:** Preflight refuses to start when a worktree is nested inside the loop's checkout, because `git add -A` would commit it as an embedded repository. The default location, `../<repo>-loops/`, is outside the checkout. Keep `LOOPS_WORKTREE_PARENT` and `LOOPS_WORKTREE_ROOT` outside it too.
 - **Fetches:** Every loop runs `git fetch` in the same repository. Two fetches at the same moment can fail to lock a ref. The loop logs the error and continues with the refs it already has.
 
 ### Using Worktrees
