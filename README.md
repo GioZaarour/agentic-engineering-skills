@@ -217,12 +217,22 @@ Everything is an environment variable with a sane default; there is no config fi
 | `MAX_REVIEW_ROUNDS` | `2` | Review ⇄ fix rounds before it gives up and asks for a human |
 | `STAGE_TIMEOUT` | `14400` | Seconds per stage; a wedge detector, not a pace target |
 | `MB_PER_JOB` | `2048` | RAM per build job — raise it for a heavy C++ toolchain, lower it for a light one |
+| `BUILD_JOBS` | measured | Build and test jobs per agent (`-j`). Pins it; the measured value is already divided between loops and between a stage's subagents |
 | `SUBAGENT_CAP_OVERRIDE` | measured | Concurrent subagents a stage may fan out to |
+| `ALLOW_WORKTREES_OVERRIDE` | measured | `yes` or `no`: whether a stage may create its own git worktrees |
+| `LOOPS_SHARE` | counted | How many loops share the machine, this one included. By default the loop counts this repository's running loops at every stage boundary. Set it to count work the loop cannot see, such as loops of another repository |
 | `STAGE_BUDGET_USD` / `TOTAL_BUDGET_USD` | `0` (off) | Cost ceilings, in dollars: per stage (passed to `claude` as `--max-budget-usd`) and per run (checked between stages, so a stage is never killed mid-edit — the run stops recoverably at exit `5`). Claude only. Codex rejects nonzero ceilings because it cannot enforce or report dollar costs. |
 | `PERMISSION_MODE` | `bypassPermissions` | Claude only. Codex uses `danger-full-access` with approvals disabled, except the adoption matcher, which uses `read-only`. |
 | `RUN_ROOT` | `.loops` | Where run artifacts go |
 
 The machine budget is **measured, not assumed**: cores, RAM, swap and free disk are read at startup, and the subagent cap, the build parallelism and whether worktrees are allowed are derived from them and injected into every prompt. The same script yields `-j1` and one subagent on a 4 GB VPS and more on a 32 GB workstation, with no edit.
+
+Two divisions happen before the numbers reach a prompt:
+
+- **Between loops.** Each loop gets an even share of cores, RAM and free disk. The share is the machine divided by the number of this repository's loops that are running, which the loop recounts at every stage boundary. A loop that started alone narrows its budget when others start, from its next stage on.
+- **Between a stage's agents.** The stage's agent and each of its subagents run their own builds, so the job count is divided by the subagent cap. On a 16 GB, 4-core machine one loop gets two subagents at `-j2` each, not two at `-j4`, which would be 16 GB of compile jobs.
+
+The budget has a floor of one job per agent. When a loop's share of RAM is smaller than `MB_PER_JOB`, preflight warns and every prompt says so, but the machine still cannot give each loop a build of its own. Run fewer loops.
 
 #### What it decides without you
 
@@ -342,10 +352,11 @@ rm .git/loops/*-issue-19.json    # Optional: forget the issue's status records
 
 #### Plan for shared resources
 
-Parallel loops share the machine, the git repository, and your accounts. The loops do not account for each other.
+Parallel loops share the machine, the git repository, and your accounts. They divide the machine's cores, RAM and disk between them, and coordinate nothing else.
 
-- **CPU and RAM:** Each loop measures the whole machine and sets its build parallelism and subagent count as if it were the only loop (see [Configuration](#configuration)). Three loops on one machine therefore ask for three times the machine's capacity. Divide the budget yourself, for example `BUILD_JOBS=2 SUBAGENT_CAP_OVERRIDE=1 ./scripts/loops run 19 21 24`.
-- **Disk:** Each worktree holds its own build artifacts. Each loop checks `MIN_DISK_GB` once, at its own start, against the free disk at that time. Stages that create their own worktrees multiply the disk use again. Set `ALLOW_WORKTREES_OVERRIDE=no` when disk is limited.
+- **CPU and RAM:** Loops divide the machine between them (see [Configuration](#configuration)). They count only this repository's loops. When other heavy work shares the machine, such as loops of another repository, set `LOOPS_SHARE` to the total.
+- **Memory ceiling:** Where a user systemd instance exists, `loops run` starts every loop inside one systemd slice, `loops.slice`, and sets its `MemoryMax` to the machine's RAM minus `LOOPS_MEMORY_RESERVE_MB` (default `1024`). The budget above is an instruction to the agent, and an agent can ignore it. Without the slice, the kernel's out-of-memory killer then picks the largest process on the machine, which can be your interactive session or the tmux server that holds every loop. With it, the killer picks a process inside the slice, and that loop stops with its work recoverable. `LOOPS_MEMORY_MAX` sets the ceiling directly, as a systemd size such as `12G`. `LOOPS_CGROUP` is `auto` by default, which uses the slice when it can and says so when it cannot; `on` refuses to start without it; `off` never uses it. macOS has no systemd, so `auto` runs loops without a ceiling there.
+- **Disk:** Each worktree holds its own build artifacts. Each loop checks `MIN_DISK_GB` once, at its own start, against the free disk at that time. Its share of free disk is re-measured at every stage boundary and decides whether its stages may create worktrees. Set `ALLOW_WORKTREES_OVERRIDE=no` when disk is limited.
 - **Usage limits:** All Claude loops draw on the same subscription. All Codex loops draw on the same Codex account. When one loop reaches the limit, the others usually reach it soon after. When the limit resets, resume each `limit` loop from `status`.
 - **Branches:** git checks out a branch in only one worktree at a time. If the issue branch is checked out in another checkout, run `loops` from that checkout or switch it to another branch before starting the dedicated worktree.
 - **Worktree location:** Preflight refuses to start when a worktree is nested inside the loop's checkout, because `git add -A` would commit it as an embedded repository. The default location, `../<repo>-loops/`, is outside the checkout. Keep `LOOPS_WORKTREE_ROOT` outside it too.

@@ -196,7 +196,6 @@ detect_disk_gb() {
 CORES=$(detect_cores);          [[ "$CORES" =~ ^[0-9]+$ && "$CORES" -gt 0 ]] || CORES=1
 MEM_TOTAL_MB=$(detect_mem_mb)
 SWAP_TOTAL_MB=$(detect_swap_mb); [[ "$SWAP_TOTAL_MB" =~ ^[0-9]+$ ]] || SWAP_TOTAL_MB=0
-DISK_FREE_GB=$(detect_disk_gb "$REPO_ROOT"); [[ "$DISK_FREE_GB" =~ ^[0-9]+$ ]] || DISK_FREE_GB=0
 
 # An undetectable amount of RAM must not become "0 MB, therefore -j1 forever",
 # and must not divide by zero either. Assume a modest machine and say so.
@@ -209,36 +208,106 @@ fi
 # a heavy C++ translation unit peaks near 2 GB, a Rust or TypeScript build far
 # less. Raise MB_PER_JOB for a heavier toolchain, lower it for a lighter one.
 MB_PER_JOB="${MB_PER_JOB:-2048}"
-BUILD_JOBS=${BUILD_JOBS:-$(( MEM_TOTAL_MB / MB_PER_JOB ))}
-(( BUILD_JOBS > CORES )) && BUILD_JOBS=$CORES
-(( BUILD_JOBS < 1 ))     && BUILD_JOBS=1
+[[ "$MB_PER_JOB" =~ ^[1-9][0-9]*$ ]] || MB_PER_JOB=2048
 
-# Concurrent subagents, and whether a stage may cut its own worktree. A
-# worktree that builds needs its own copy of every build artifact, so disk —
-# not RAM — is what gates it.
+# A worktree that builds needs its own copy of every build artifact, so disk —
+# not RAM — is what gates whether a stage may cut one.
 WORKTREE_DISK_GB="${WORKTREE_DISK_GB:-20}"
 MIN_DISK_GB="${MIN_DISK_GB:-5}"
 
-if (( CORES < 4 || MEM_TOTAL_MB < 8192 )); then
-  SUBAGENT_CAP=1
-else
-  SUBAGENT_CAP=2
-fi
-SUBAGENT_CAP=${SUBAGENT_CAP_OVERRIDE:-$SUBAGENT_CAP}
+# What the user pinned, kept apart from what compute_budget derives, so a
+# recomputation can tell "set by hand" from "set by the last recomputation".
+USER_BUILD_JOBS="${BUILD_JOBS:-}"
+USER_SUBAGENT_CAP="${SUBAGENT_CAP_OVERRIDE:-}"
+USER_ALLOW_WORKTREES="${ALLOW_WORKTREES_OVERRIDE:-}"
 
-if (( SUBAGENT_CAP > 1 && DISK_FREE_GB >= WORKTREE_DISK_GB )); then
-  ALLOW_WORKTREES=yes
-else
-  ALLOW_WORKTREES=no
-fi
-ALLOW_WORKTREES=${ALLOW_WORKTREES_OVERRIDE:-$ALLOW_WORKTREES}
+# ── count_other_loops ─────────────────────────────────────────────────────
+# Issue loops of this repository that are running right now, not counting this
+# one. Every worktree shares the status registry (see write_status), so a loop
+# in any worktree is visible here. A `running` record whose process is gone is a
+# loop that was SIGKILLed; it uses nothing, so it does not count. Loops of OTHER
+# repositories on the same machine are invisible — set LOOPS_SHARE for those.
+count_other_loops() {
+  local dir pid n=0
+  dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/loops"
+  compgen -G "$dir/*.json" >/dev/null || { echo 0; return 0; }
+  while read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$$" ]] && kill -0 "$pid" 2>/dev/null && n=$(( n + 1 ))
+  done < <(jq -r 'select(.state == "running") | .pid' "$dir"/*.json 2>/dev/null)
+  echo "$n"
+}
+
+# ── compute_budget ────────────────────────────────────────────────────────
+# Derives this loop's share of the machine and rebuilds RESOURCE_NOTE from it.
+#
+# The running loops of this repository divide the machine evenly: LOOPS_SHARING
+# is this loop plus every other running one (or LOOPS_SHARE, when set). Within a share, build jobs
+# are split again across the agents that can build at once — the stage's agent
+# and each of its subagents runs its own `-j`, so a cap of 2 subagents at -j4 is
+# eight compile jobs, not four.
+#
+# Called at source time and again at every stage boundary (mark_stage), so a
+# loop started alone narrows its budget once others start, and widens it when
+# they finish. A stage already running keeps the budget it started with.
+compute_budget() {
+  local sharing jobs
+  sharing="${LOOPS_SHARE:-$(( $(count_other_loops) + 1 ))}"
+  [[ "$sharing" =~ ^[1-9][0-9]*$ ]] || sharing=1
+  LOOPS_SHARING=$sharing
+
+  # Re-measured every time: other loops' builds are what consumes it.
+  DISK_FREE_GB=$(detect_disk_gb "$REPO_ROOT"); [[ "$DISK_FREE_GB" =~ ^[0-9]+$ ]] || DISK_FREE_GB=0
+
+  SHARE_MEM_MB=$(( MEM_TOTAL_MB / LOOPS_SHARING ))
+  SHARE_CORES=$(( CORES / LOOPS_SHARING )); (( SHARE_CORES < 1 )) && SHARE_CORES=1
+  SHARE_DISK_GB=$(( DISK_FREE_GB / LOOPS_SHARING ))
+
+  if (( SHARE_CORES < 4 || SHARE_MEM_MB < 8192 )); then
+    SUBAGENT_CAP=1
+  else
+    SUBAGENT_CAP=2
+  fi
+  SUBAGENT_CAP=${USER_SUBAGENT_CAP:-$SUBAGENT_CAP}
+
+  jobs=$(( SHARE_MEM_MB / MB_PER_JOB ))
+  (( jobs > SHARE_CORES )) && jobs=$SHARE_CORES
+  [[ "$SUBAGENT_CAP" =~ ^[0-9]+$ ]] && (( SUBAGENT_CAP > 1 )) && jobs=$(( jobs / SUBAGENT_CAP ))
+  (( jobs < 1 )) && jobs=1
+  BUILD_JOBS=${USER_BUILD_JOBS:-$jobs}
+
+  if [[ "$SUBAGENT_CAP" =~ ^[0-9]+$ ]] && (( SUBAGENT_CAP > 1 && SHARE_DISK_GB >= WORKTREE_DISK_GB )); then
+    ALLOW_WORKTREES=yes
+  else
+    ALLOW_WORKTREES=no
+  fi
+  ALLOW_WORKTREES=${USER_ALLOW_WORKTREES:-$ALLOW_WORKTREES}
+
+  # The floor of one job per agent is not a guarantee that one job fits. Below
+  # it, the machine cannot give every loop a build of its own, and the only
+  # defence left is not building at the same time.
+  SHARE_BELOW_ONE_JOB=no
+  (( SHARE_MEM_MB < MB_PER_JOB )) && SHARE_BELOW_ONE_JOB=yes
+
+  build_resource_note
+}
 
 # ── the budget every stage is told about ──────────────────────────────────
-read -r -d '' RESOURCE_NOTE <<EOF || true
+build_resource_note() {
+  local sharing_line="" tight_line=""
+  if (( LOOPS_SHARING > 1 )); then
+    sharing_line="${LOOPS_SHARING} issue loops share this host right now. This loop's share: ${SHARE_CORES} core(s), ${SHARE_MEM_MB} MB RAM, ${SHARE_DISK_GB} GB of the free disk. The numbers below are for this loop alone."
+  fi
+  if [[ "$SHARE_BELOW_ONE_JOB" == yes ]]; then
+    tight_line="- **This loop's share of RAM is smaller than one build job (${MB_PER_JOB} MB).**
+  Build and test only when the work needs it, never run two builds at once,
+  and prefer the narrowest target that proves the change."
+  fi
+  read -r -d '' RESOURCE_NOTE <<EOF || true
 ## Machine budget — unattended run, this is a hard constraint
 
 Host: ${CORES} cores, ${MEM_TOTAL_MB} MB RAM$([[ "$MEM_MEASURED" == no ]] && echo " (assumed — could not measure)"), ${SWAP_TOTAL_MB} MB swap, ${DISK_FREE_GB} GB free disk.
-No one is watching. If you exhaust RAM or disk, the OOM killer takes this
+${sharing_line:+$sharing_line
+}No one is watching. If you exhaust RAM or disk, the OOM killer takes this
 process down mid-edit and the work is lost, not merely slowed.
 
 - **Run at most ${SUBAGENT_CAP} subagent(s) at a time.** If a skill tells you to fan out
@@ -246,12 +315,14 @@ process down mid-edit and the work is lost, not merely slowed.
 - **Creating git worktrees is ${ALLOW_WORKTREES} on this host.** If it is "no", work in the
   current tree, one slice at a time — a second worktree needs its own full set
   of build artifacts and there is not room for one.
-- **Cap build and test parallelism at ${BUILD_JOBS} job(s)** — \`-j${BUILD_JOBS}\`, \`--jobs ${BUILD_JOBS}\`,
-  \`maxWorkers=${BUILD_JOBS}\`, whatever this toolchain calls it. Most build tools default
-  to cores or cores+2 and will OOM this machine. If the repo's own docs
-  recommend a higher number, **do not "fix" the docs** — that number is right
-  for the machine it documents; only this run is constrained.
-- Run the tests. A stage that reports success without a green suite has not
+- **Cap build and test parallelism at ${BUILD_JOBS} job(s) per agent** — \`-j${BUILD_JOBS}\`, \`--jobs ${BUILD_JOBS}\`,
+  \`maxWorkers=${BUILD_JOBS}\`, whatever this toolchain calls it. The cap applies to you
+  and to each subagent separately; it is already divided between them. Most
+  build tools default to cores or cores+2 and will OOM this machine. If the
+  repo's own docs recommend a higher number, **do not "fix" the docs** — that
+  number is right for the machine it documents; only this run is constrained.
+${tight_line:+$tight_line
+}- Run the tests. A stage that reports success without a green suite has not
   finished. If a suite genuinely cannot run on this host (no display, no
   browser, no device, missing hardware), say so explicitly in your final
   message instead of skipping it silently.
@@ -261,11 +332,14 @@ process down mid-edit and the work is lost, not merely slowed.
   driving you, not the code under change.
 EOF
 
-# Whatever the project needs said about itself, said once, in every prompt.
-if [[ -r "$LOOP_NOTES" ]]; then
-  RESOURCE_NOTE+=$'\n\n## Project-specific instructions for this run\n\n'
-  RESOURCE_NOTE+="$(cat "$LOOP_NOTES")"
-fi
+  # Whatever the project needs said about itself, said once, in every prompt.
+  if [[ -r "$LOOP_NOTES" ]]; then
+    RESOURCE_NOTE+=$'\n\n## Project-specific instructions for this run\n\n'
+    RESOURCE_NOTE+="$(cat "$LOOP_NOTES")"
+  fi
+}
+
+compute_budget
 
 # ── ensure_run_root_excluded ──────────────────────────────────────────────
 # Put $RUN_ROOT in .git/info/exclude, which is per-clone and branch-independent
@@ -349,7 +423,17 @@ write_status() {
     && mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"
 }
 
-mark_stage() { STATUS_STAGE="$1"; write_status; }
+# A stage boundary is also where the machine budget is re-read: loops started
+# or finished since the last stage change this loop's share. The change is
+# logged because it changes what the next stage is told it may run.
+mark_stage() {
+  local before="$LOOPS_SHARING/$BUILD_JOBS/$SUBAGENT_CAP/$ALLOW_WORKTREES"
+  compute_budget
+  if [[ "$LOOPS_SHARING/$BUILD_JOBS/$SUBAGENT_CAP/$ALLOW_WORKTREES" != "$before" ]]; then
+    log "   budget: ${LOOPS_SHARING} loop(s) on this host — -j${BUILD_JOBS} per agent, ${SUBAGENT_CAP} subagent(s), worktrees=${ALLOW_WORKTREES}"
+  fi
+  STATUS_STAGE="$1"; write_status
+}
 
 # The exit code is the outcome (see the entrypoint's header); a signal means
 # someone killed the run, typically by closing its tmux session. SIGKILL runs no
@@ -561,7 +645,9 @@ commit_leftovers() {
 preflight_common() {
   log "preflight"
   log "   host: ${CORES} cores, ${MEM_TOTAL_MB} MB RAM, ${SWAP_TOTAL_MB} MB swap, ${DISK_FREE_GB} GB free"
-  log "   budget: -j${BUILD_JOBS} builds, ${SUBAGENT_CAP} subagent(s), worktrees=${ALLOW_WORKTREES}"
+  log "   budget: ${LOOPS_SHARING} loop(s) on this host — -j${BUILD_JOBS} per agent, ${SUBAGENT_CAP} subagent(s), worktrees=${ALLOW_WORKTREES}"
+  [[ "$SHARE_BELOW_ONE_JOB" == yes ]] \
+    && warn "each of ${LOOPS_SHARING} loops gets ${SHARE_MEM_MB} MB, less than one ${MB_PER_JOB} MB build job — concurrent builds can exhaust RAM"
   local bin
   for bin in "$LOOP_CLI" gh jq git awk sed df; do
     command -v "$bin" >/dev/null || { warn "missing: $bin"; exit 2; }
