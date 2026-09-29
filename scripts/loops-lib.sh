@@ -327,6 +327,55 @@ init_run() {
   DEADLINE=$(( $(date +%s) + DEADLINE_HOURS * 3600 ))
 }
 
+# ── run status ────────────────────────────────────────────────────────────
+# One JSON file per run in the repo's common git directory, which every
+# worktree shares, so `scripts/loops status` can list parallel runs without
+# knowing where their worktrees are. A run writes only its own file, through a
+# rename, so a reader never sees a partial one. `from` is the stage a resume
+# starts at; empty means rerun from the top.
+STATUS_FILE=""; STATUS_STATE=running; STATUS_STAGE=preflight
+STATUS_REASON=""; STATUS_FROM=""; STATUS_TMUX=""; STATUS_STARTED=0
+
+write_status() {
+  [[ -n "$STATUS_FILE" ]] || return 0
+  local from="$STATUS_FROM"
+  [[ -z "$from" && " ${STAGE_ORDER[*]} " == *" $STATUS_STAGE "* ]] && from="$STATUS_STAGE"
+  jq -n --argjson issue "$ISSUE" --arg cli "$LOOP_CLI" --arg state "$STATUS_STATE" \
+    --arg stage "$STATUS_STAGE" --arg reason "$STATUS_REASON" --arg from "$from" \
+    --arg branch "${BRANCH:-}" --arg base "$BASE_BRANCH" --arg pr "${PR_URL:-}" \
+    --arg tmux "$STATUS_TMUX" --arg worktree "$REPO_ROOT" --arg log "$LOG" \
+    --argjson pid $$ --argjson started "$STATUS_STARTED" --argjson updated "$(date +%s)" \
+    --argjson exit_code "${1:-null}" '$ARGS.named' >"$STATUS_FILE.tmp" \
+    && mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"
+}
+
+mark_stage() { STATUS_STAGE="$1"; write_status; }
+
+# The exit code is the outcome (see the entrypoint's header); a signal means
+# someone killed the run, typically by closing its tmux session. SIGKILL runs no
+# trap at all, which is why `loops status` also checks that the pid is alive.
+finish_status() {
+  case "$1" in
+    0) STATUS_STATE=done ;;
+    3) STATUS_STATE=needs-human ;;
+    4) STATUS_STATE=limit ;;
+    129|130|143) STATUS_STATE=killed ;;
+    *) STATUS_STATE=failed ;;
+  esac
+  write_status "$1"
+}
+
+init_status() {
+  local dir
+  dir="$(git rev-parse --path-format=absolute --git-common-dir)/loops" && mkdir -p "$dir" || return 0
+  STATUS_FILE="$dir/${RUN_DIR##*/}.json"
+  STATUS_STARTED=$(date +%s)
+  [[ -n "${TMUX:-}" ]] && STATUS_TMUX=$(tmux display-message -p '#S' 2>/dev/null)
+  trap 'finish_status $?' EXIT
+  trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+  write_status
+}
+
 log()  { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG"; }
 warn() { printf '%s  !! %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG" >&2; }
 
@@ -492,13 +541,18 @@ return_to_base() {
 }
 
 # Capture anything a skill left uncommitted, so it cannot ride onto the next
-# branch. Returns 0 whether or not there was anything.
+# branch. Returns 0 when there was nothing to commit or the commit landed, and 1
+# when git refused it — a pre-commit hook, a missing identity, a full disk. The
+# caller must stop on 1: the stage's edits then exist only in this worktree, and
+# pushing HEAD would publish the branch without them.
 commit_leftovers() {
-  if [[ -n "$(git status --porcelain)" ]]; then
-    git add -A && git commit -qm "$1" >>"$LOG" 2>&1
+  [[ -n "$(git status --porcelain)" ]] || return 0
+  if git add -A >>"$LOG" 2>&1 && git commit -qm "$1" >>"$LOG" 2>&1; then
     log "   captured uncommitted leftovers"
+    return 0
   fi
-  return 0
+  warn "could not commit leftovers ('$1') — the edits remain uncommitted in the worktree; git's error is in $LOG"
+  return 1
 }
 
 # ── preflight_common ──────────────────────────────────────────────────────
@@ -575,9 +629,14 @@ preflight_common() {
   [[ -z "$(git status --porcelain)" ]] \
     || { warn "working tree is dirty — commit or stash first"; exit 2; }
 
+  # Only a worktree nested inside this checkout is a hazard: `git add -A` would
+  # commit it as an embedded repository. Sibling worktrees, including other
+  # loops running in parallel, never touch this tree.
   git worktree prune
-  if [[ $(git worktree list | wc -l) -gt 1 ]]; then
-    warn "extra git worktrees present — remove them first:"; git worktree list | tee -a "$LOG"; exit 2
+  local nested
+  nested=$(git worktree list --porcelain | sed -n 's/^worktree //p' | grep -F "$REPO_ROOT/")
+  if [[ -n "$nested" ]]; then
+    warn "git worktrees inside this checkout — remove them first:"; tee -a "$LOG" <<<"$nested"; exit 2
   fi
 
   (( DISK_FREE_GB >= MIN_DISK_GB )) \
@@ -649,6 +708,9 @@ EOF
 #   0   clean
 #   >0  findings remain after MAX_REVIEW_ROUNDS
 #   -1  a stage failed, or the reviewer emitted no sentinel — unverified
+# Returns 1 when a fix round's edits cannot be committed. The tree then holds
+# changes that no commit records, so the caller must stop rather than review,
+# document, or push around them.
 # Keeps all fixes local. Does not touch labels; the caller owns that.
 review_fix_cycle() {
   local issue="$1" dir="$2" spec="$3" base="$4" round
@@ -703,7 +765,7 @@ ${RESOURCE_NOTE}
 EOF
 )" "$dir/fix-$round.json" || { BLOCKING=-1; break; }
 
-    commit_leftovers "fix(#$issue): review round $round leftovers"
+    commit_leftovers "fix(#$issue): review round $round leftovers" || return 1
   done
 
   # Falling out of the loop with BLOCKING > 0 means the last thing that ran was
@@ -747,6 +809,6 @@ another branch, or open a pull request.
 ${RESOURCE_NOTE}
 EOF
 )" "$dir/ctx.json" || { warn "#$issue: update-context failed"; return 1; }
-  commit_leftovers "docs(#$issue): update AGENTS.md context"
+  commit_leftovers "docs(#$issue): update AGENTS.md context" || return 1
   return 0
 }

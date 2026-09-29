@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+#
+# loops — run issue loops in parallel, one git worktree and one tmux session
+# per issue, and show where every run in this repo got to.
+#
+#   ./scripts/loops run 19 21 24                   # Claude, three loops at once
+#   ./scripts/loops run --cli codex 24 -- --no-push  # args after -- go to each loop
+#   ./scripts/loops status [--all]                 # latest run per issue, or every run
+#
+# Each loop records its progress in <git common dir>/loops/<run-id>.json (see
+# write_status in loops-lib.sh). That directory is shared by every worktree, so
+# this command finds every run without knowing where its worktree is.
+
+set -uo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)" || exit 2
+REGISTRY="$COMMON_DIR/loops"
+MAIN_ROOT="$(dirname "$COMMON_DIR")"
+REPO_NAME="$(basename "$MAIN_ROOT")"
+BASE_BRANCH="${BASE_BRANCH:-main}"
+WORKTREE_ROOT="${LOOPS_WORKTREE_ROOT:-$(dirname "$MAIN_ROOT")/$REPO_NAME-loops}"
+
+usage() {
+  sed -n '6,8p' "${BASH_SOURCE[0]}" | sed 's/^# //'
+}
+
+# Registry entries, newest last, one line per run with \x1f between fields.
+# The separator is not whitespace, so `read` keeps empty fields in place.
+runs() {
+  local all="$1" files=("$REGISTRY"/*.json)
+  [[ -e "${files[0]}" ]] || return 0
+  jq -rs --argjson all "$all" --argjson now "$(date +%s)" '
+    sort_by(.started)
+    | if $all then . else group_by(.issue) | map(last) | sort_by(.issue) end
+    | .[] | [.issue, .cli, .stage, .state, .pid, .branch, .base, ($now - .updated),
+             .from, .pr, .tmux, .reason, .log] | map(tostring) | join("\u001f")' "${files[@]}"
+}
+
+ago() {
+  local s="$1"
+  if   (( s < 3600 ));  then echo "$(( s / 60 ))m"
+  elif (( s < 86400 )); then echo "$(( s / 3600 ))h"
+  else echo "$(( s / 86400 ))d"
+  fi
+}
+
+cmd_status() {
+  local all=false issue cli stage state pid branch base age from pr tmux reason log commits next
+  [[ "${1:-}" == --all || "${1:-}" == -a ]] && all=true
+  compgen -G "$REGISTRY/*.json" >/dev/null || { echo "no loop runs recorded in $REGISTRY"; return 0; }
+  printf '%-6s %-7s %-12s %-12s %-8s %-8s %s\n' ISSUE CLI STAGE STATE COMMITS UPDATED NEXT
+  while IFS=$'\x1f' read -r issue cli stage state pid branch base age from pr tmux reason log; do
+    # A run that says it is running but whose process is gone was SIGKILLed or
+    # lost its machine; nothing got to record that, so infer it here.
+    if [[ "$state" == running ]] && ! kill -0 "$pid" 2>/dev/null; then
+      state=died; reason="the process exited without recording an outcome"
+    fi
+    commits=-
+    [[ -n "$branch" ]] && commits=$(git rev-list --count "origin/$base..$branch" 2>/dev/null || echo -)
+    case "$state" in
+      running) next=${tmux:+"tmux attach -t $tmux"}; next=${next:-"tail -f $log"} ;;
+      done)    next=${pr:-done} ;;
+      *)       next="./scripts/loops run"; [[ "$cli" == codex ]] && next+=" --cli codex"
+               next+=" $issue${from:+ -- --from $from}" ;;
+    esac
+    printf '%-6s %-7s %-12s %-12s %-8s %-8s %s\n' "#$issue" "$cli" "$stage" "$state" \
+      "$commits" "$(ago "$age")" "$next"
+    [[ "$state" == running || "$state" == done ]] || printf '       ↳ %s · %s\n' "${reason:-see the log}" "$log"
+  done < <(runs "$all")
+}
+
+# Starts each issue in its own tmux session. A resumed issue reuses the
+# worktree its last run used; a new one gets a detached worktree at the tip of
+# origin/<base>, and the loop creates or adopts the issue's branch in it.
+cmd_run() {
+  local cli=claude n wt session rc=0 var
+  local -a issues=() pass=() env_args=()
+  while (( $# )); do
+    case "$1" in
+      --cli) cli="$2"; shift 2 ;;
+      --)    shift; pass=("$@"); break ;;
+      -h|--help) usage; return 0 ;;
+      *)     [[ "$1" =~ ^[0-9]+$ ]] || { usage >&2; return 2; }; issues+=("$1"); shift ;;
+    esac
+  done
+  [[ "$cli" == claude || "$cli" == codex ]] || { echo "--cli must be claude or codex" >&2; return 2; }
+  (( ${#issues[@]} )) || { usage >&2; return 2; }
+  command -v tmux >/dev/null || { echo "tmux is required" >&2; return 2; }
+
+  # A session started by a running tmux server inherits the server's
+  # environment, not this shell's. Forward PATH and every loop setting that is
+  # set here, so PLAN_MODEL=... ./scripts/loops run ... behaves as it reads.
+  for var in PATH $(grep -ohE '\$\{[A-Z_]+:-' "$SCRIPT_DIR"/loops-lib.sh "$SCRIPT_DIR"/claude-issue-loop.sh \
+                    | tr -d '${:-' | sort -u); do
+    [[ "$var" != TMUX && -n "${!var+x}" ]] && env_args+=(-e "$var=${!var}")
+  done
+
+  git fetch -q origin || { echo "cannot fetch origin" >&2; return 2; }
+  for n in "${issues[@]}"; do
+    session="${REPO_NAME//[.:]/_}-$n"
+    if tmux has-session -t "=$session" 2>/dev/null; then
+      echo "#$n is already running — tmux attach -t $session"; continue
+    fi
+    wt=$(jq -rs --argjson n "$n" 'map(select(.issue == $n)) | sort_by(.started) | last | .worktree // empty' \
+         "$REGISTRY"/*.json 2>/dev/null)
+    [[ -n "$wt" && -d "$wt" ]] || wt="$WORKTREE_ROOT/issue-$n"
+    if [[ ! -d "$wt" ]] && ! git worktree add -q --detach "$wt" "origin/$BASE_BRANCH"; then
+      echo "#$n: cannot create worktree $wt" >&2; rc=1; continue
+    fi
+    tmux new-session -d -s "$session" -c "$wt" "${env_args[@]}" \
+      "$(printf '%q ' "$SCRIPT_DIR/$cli-issue-loop.sh" "$n" ${pass[@]+"${pass[@]}"})" \
+      || { rc=1; continue; }
+    echo "#$n started in $wt — tmux attach -t $session"
+  done
+  echo "progress: ./scripts/loops status"
+  return "$rc"
+}
+
+case "${1:-}" in
+  run)    shift; cmd_run "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  *)      usage >&2; exit 2 ;;
+esac

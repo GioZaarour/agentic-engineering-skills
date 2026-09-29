@@ -92,11 +92,11 @@ The `spec-review` stage does not call `/review-spec`. That skill is an interview
 #### Setup
 
 1. Install the skills — `./install.sh`, as above. The loop calls `/spec-from-issue`, `/implement-spec`, `/techdebt`, `/branch-review`, and `/update-context`. Those skills and the inline PR-writing stages use `/clear-technical-writing` for human-facing text. Preflight checks for all six skills and warns (it does not block) if it cannot find one, so a missing skill shows up in the first ten seconds instead of an hour into a run.
-2. Copy `scripts/claude-issue-loop.sh`, `scripts/codex-issue-loop.sh`, and `scripts/loops-lib.sh` into your own repo, under `scripts/`. They must sit next to each other. Committing them to your repo is the simplest thing to do; if you would rather keep them untracked, add all three paths to `.git/info/exclude` — **not** `.gitignore`. `.gitignore` is tracked and therefore branch-scoped, so a rule you add on `main` does not exist on the feature branch the loop is about to `git add -A` on. Preflight refuses to start unless one of the two is true.
+2. Copy `scripts/claude-issue-loop.sh`, `scripts/codex-issue-loop.sh`, `scripts/loops-lib.sh`, and `scripts/loops` into your own repo, under `scripts/`. They must sit next to each other. Committing them to your repo is the simplest thing to do; if you would rather keep them untracked, add all four paths to `.git/info/exclude` — **not** `.gitignore`. `.gitignore` is tracked and therefore branch-scoped, so a rule you add on `main` does not exist on the feature branch the loop is about to `git add -A` on. Preflight refuses to start unless one of the two is true.
 3. On your PATH: `claude` or `codex` for your chosen entrypoint, plus `gh`, `jq`, `git`, and bash **4.2 or newer**. macOS ships bash 3.2 as `/bin/bash` — `brew install bash` and make sure it comes first, or the scripts will die on a syntax error. macOS also has no `timeout`; `brew install coreutils` gives you `gtimeout`, which the scripts find on their own. Without it a wedged stage hangs forever instead of being killed at `STAGE_TIMEOUT`.
 4. Run `gh auth login` and either `claude auth login` or `codex login` on the machine that will run the loop. Codex uses its existing CLI login and checks it with `codex login status`.
 5. Optional but worth ten minutes: copy `scripts/loop-notes.example.md` to `.loop-notes.md` at your repo root and rewrite it for your project — how to build, how to run tests, which suites cannot run on this host, which toolchain is not on PATH. Every stage gets that text appended to its prompt. Without it, each stage works your build and test commands out from the repo, over and over, and sometimes gets them wrong.
-6. Start from a **clean working tree**. Preflight refuses to run dirty, and refuses to run with extra worktrees present. Which branch you are standing on does not matter — it checks out the issue's branch, or creates it from `BASE_BRANCH`; the one thing it will not do is resolve the issue's branch *to* the base branch and commit there.
+6. Start from a **clean working tree**. Preflight refuses to run dirty, and refuses to run with a git worktree nested inside the checkout. Sibling worktrees, such as other loops running in parallel, are fine. Which branch you are standing on does not matter — it checks out the issue's branch, or creates it from `BASE_BRANCH`; the one thing it will not do is resolve the issue's branch *to* the base branch and commit there.
 
 #### First run: always dry-run first
 
@@ -173,7 +173,7 @@ The exit code determines how you resume the run:
 | `2` | Preflight or usage error; nothing was touched | Fix what it reported and run again |
 | `3` | Needs a human: the spec `BLOCKED`, or findings survived the fix rounds (or the review never returned a verdict) | Read the file it names — `.loops/latest/<N>/review-verify.md`, or the spec's `## BLOCKED` section — resolve it, then resume |
 | `4` | Hit an account spend/usage limit mid-run | The branch is pushed and safe to leave; resume once the limit resets |
-| `5` | A stage failed outright | The branch is pushed as a WIP commit; the summary names the exact resume command |
+| `5` | A stage failed outright, git refused to commit a stage's edits (for example, a pre-commit hook rejected them), or a push failed | Normally the branch is pushed as a WIP commit and the summary names the exact resume command. If the summary reports a refused commit, the edits are still uncommitted in the worktree; if it reports a failed push, the latest commits exist only locally. Commit or push them by hand before you resume |
 
 Every stop prints a summary block with the resume command already filled in, e.g.:
 
@@ -232,9 +232,130 @@ So the PR description's **"Decided without human input"** section is not boilerp
 
 Two more places the loop guesses, both of which the `--dry-run` shows you: the **type** (from labels, then the title, then `DEFAULT_TYPE`) and, when nothing matching the issue number exists, whether an off-convention branch or spec is really this issue's. The matcher for that second one is a model with read-only tools or a read-only sandbox, it may only return a name that is already on the list it was given, and the shell re-checks the answer against git and the filesystem before using it — a hallucinated branch name is discarded, not checked out.
 
+### Running loops in parallel
+
+`scripts/loops` runs several issue loops at the same time on one machine. It gives each issue its own git worktree and its own tmux session, then reports the state of every loop run in the repository with one command.
+
+The loops do not coordinate with each other. Choose issues that change separate parts of the codebase. Two loops that edit the same files each produce a PR, and those PRs conflict.
+
+#### Requirements
+
+- Complete the loop [Setup](#setup) first. The parallel command uses the same scripts, logins, and skills.
+- Copy `scripts/loops` next to the other three scripts.
+- Install tmux 3.0 or newer and git 2.31 or newer.
+
+#### Start loops
+
+```bash
+./scripts/loops run 19 21 24                 # three Claude loops
+./scripts/loops run --cli codex 27           # one Codex loop
+PLAN_MODEL=claude-fable-5-1 ./scripts/loops run 30 31   # settings apply to every loop
+./scripts/loops run 19 -- --merge-base       # arguments after -- go to every loop
+```
+
+For each issue number, `loops run` does the following:
+
+1. It names the tmux session `<repo>-<N>`, for example `myapp-19`. If a session with that name exists, it skips the issue and prints the `tmux attach` command.
+2. It chooses a worktree. If an earlier run of the issue used a worktree that still exists, it reuses that worktree. Otherwise it creates a new worktree at `../<repo>-loops/issue-<N>`, detached at `origin/<BASE_BRANCH>`. Set `LOOPS_WORKTREE_ROOT` to create new worktrees somewhere else.
+3. It starts `<cli>-issue-loop.sh <N>` in the new session, inside that worktree. The loop then creates or adopts the issue's branch, exactly as a single run does.
+
+Some details affect how you call it:
+
+- `--cli` and the arguments after `--` apply to every issue in the command. To give issues different flags or different CLIs, run `loops run` once for each group.
+- `loops run` starts the loop scripts from the directory that contains `scripts/loops`, not from the worktree's copy. So untracked scripts work, and every loop runs the same version of the scripts.
+- A new tmux session receives the tmux server's environment, not your shell's. `loops run` therefore forwards `PATH` and each loop setting from [Configuration](#configuration) that is set in your shell.
+- Always do a dry run of a new issue first, as described in [First run](#first-run-always-dry-run-first). `loops run 19 -- --dry-run` works, but its output disappears when the session exits.
+
+#### Check progress
+
+```bash
+./scripts/loops status         # the latest run of each issue
+./scripts/loops status --all   # every recorded run, oldest first
+```
+
+The command works from the main checkout and from any worktree:
+
+```
+ISSUE  CLI     STAGE        STATE        COMMITS  UPDATED  NEXT
+#19    claude  review       limit        7        2h       ./scripts/loops run 19 -- --from review
+       ↳ account usage limit · /…/myapp-loops/issue-19/.loops/20260928-101500-issue-19/run.log
+#21    claude  implement    running      3        4m       tmux attach -t myapp-21
+#24    codex   pr           done         11       40m      https://github.com/…/pull/88
+#27    codex   techdebt     died         5        3h       ./scripts/loops run --cli codex 27 -- --from techdebt
+       ↳ the process exited without recording an outcome · /…/run.log
+```
+
+| Column | Meaning |
+|---|---|
+| `STAGE` | The last stage the loop started. Before the issue's stages, this is `preflight` or `sync`. |
+| `STATE` | The outcome. See the next table. |
+| `COMMITS` | The number of commits on the issue's branch that are not on `origin/<base>`. It is counted when you run `status`, not read from the record. |
+| `UPDATED` | Time since the loop last wrote its record. |
+| `NEXT` | The command to run next: attach to a running session, open the PR, or resume. A loop that stopped also gets a second line with the reason and its log path. |
+
+| State | Meaning | Next action |
+|---|---|---|
+| `running` | The loop is running, and its process exists. | Attach to its session, or wait. |
+| `done` | The loop exited with code `0`. | Read the PR. |
+| `needs-human` | Exit `3`. The spec is `BLOCKED`, or review findings remain. | Fix it in the worktree (see [Resume a stopped loop](#resume-a-stopped-loop)). |
+| `limit` | Exit `4`. The account reached its usage limit. | Resume after the limit resets. |
+| `failed` | Exit `2` or `5`. Preflight, git, or a stage failed. | Read the reason and the log, fix the cause, then resume. |
+| `killed` | The loop received `SIGHUP`, `SIGINT`, or `SIGTERM`, for example because its tmux session was closed. | Resume. |
+| `died` | The record says `running`, but the process no longer exists. The loop was killed with `SIGKILL`, or the machine went down. No trap could run to record the outcome. | Run `git status` in the worktree, then resume. |
+
+Each loop writes two kinds of files:
+
+- The status record, at `.git/loops/<run-id>.json`. The run ID is `<timestamp>-issue-<N>`. The `.git/loops/` directory is in the repository's common git directory, which every worktree shares, so `status` finds every loop without needing to know where the worktrees are. Each loop writes only its own record, so parallel loops never write to the same file. The loop writes the record at start, at each stage, and at exit.
+- The full log and model output, in the worktree's own `.loops/` directory, as described in [Watching it run](#watching-it-run). To follow one loop, run `tail -f .loops/latest/run.log` inside its worktree.
+
+Status records are never deleted automatically. When you remove a worktree, its records remain, but the log paths in them no longer exist.
+
+#### Resume a stopped loop
+
+Run the command in the `NEXT` column. It reuses the issue's worktree, starts a new session, and passes `--from <stage>` to the loop. The command includes `--cli codex` when the stopped run used Codex.
+
+For `needs-human`, fix the problem before you resume:
+
+1. Change to the issue's worktree. Its path is in the log path on the `↳` line.
+2. Read the file that the summary names in the log, such as the spec's `## BLOCKED` section or `review-verify.md`.
+3. Make the fix on the issue's branch and commit it. The loop's preflight refuses to start on a dirty worktree.
+4. Run the `NEXT` command.
+
+#### Stop a loop
+
+```bash
+tmux kill-session -t myapp-19
+```
+
+The loop script receives `SIGHUP` and records `killed`, but only after the current stage process exits. When `timeout` or `gtimeout` is installed, as [Setup](#setup) recommends, it runs the stage's `claude` or `codex` process in a separate process group. Closing the session then does not stop that process. It continues until it finishes or reaches `STAGE_TIMEOUT`, and until then `status` shows the loop as `running`.
+
+#### Clean up
+
+After an issue's PR is merged, remove its worktree:
+
+```bash
+git worktree remove ../myapp-loops/issue-19
+rm .git/loops/*-issue-19.json    # Optional: forget the issue's status records
+```
+
+`git worktree remove` accepts the worktree's `.loops/` directory because the loop adds `.loops` to `.git/info/exclude`, so git ignores it.
+
+#### Plan for shared resources
+
+Parallel loops share the machine, the git repository, and your accounts. The loops do not account for each other.
+
+- **CPU and RAM:** Each loop measures the whole machine and sets its build parallelism and subagent count as if it were the only loop (see [Configuration](#configuration)). Three loops on one machine therefore ask for three times the machine's capacity. Divide the budget yourself, for example `BUILD_JOBS=2 SUBAGENT_CAP_OVERRIDE=1 ./scripts/loops run 19 21 24`.
+- **Disk:** Each worktree holds its own build artifacts. Each loop checks `MIN_DISK_GB` once, at its own start, against the free disk at that time. Stages that create their own worktrees multiply the disk use again. Set `ALLOW_WORKTREES_OVERRIDE=no` when disk is limited.
+- **Usage limits:** All Claude loops draw on the same subscription. All Codex loops draw on the same Codex account. When one loop reaches the limit, the others usually reach it soon after. When the limit resets, resume each `limit` loop from `status`.
+- **Branches:** git checks out a branch in only one worktree at a time. If an issue's branch is checked out in your main checkout, that loop fails at `sync` with `cannot checkout`. Switch the main checkout to another branch, then resume.
+- **Worktree location:** Preflight refuses to start when a worktree is nested inside the loop's checkout, because `git add -A` would commit it as an embedded repository. The default location, `../<repo>-loops/`, is outside the checkout. Keep `LOOPS_WORKTREE_ROOT` outside it too.
+- **Fetches:** Every loop runs `git fetch` in the same repository. Two fetches at the same moment can fail to lock a ref. The loop logs the error and continues with the refs it already has.
+
 ### Using Worktrees
 
 You can spin up git worktrees if you want to work on multiple tickets/features at a time, on the same machine. I would recommend not doing this for two tasks that have a lot of overlapping surface area in the codebase. It can be great for parallelizable work, though.
+
+To run the issue loop on several issues in parallel worktrees, use `scripts/loops` instead (see [Running loops in parallel](#running-loops-in-parallel)).
 
 e.g. I'm in codebase root and want to make a worktree in the same folder and immediately get onto a new branch to do parallel PRs:
 ```bash

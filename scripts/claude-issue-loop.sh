@@ -36,7 +36,8 @@
 #   2  preflight or usage error — nothing was touched
 #   3  needs a human: the spec BLOCKED, or findings remain after the fix rounds
 #   4  account spend/usage limit — resume with --from once it resets
-#   5  a stage failed; the branch is pushed and recoverable, see the resume hint
+#   5  a stage failed, git refused to commit a stage's edits, or a push failed;
+#      the summary says what is saved where, and how to resume
 #
 # Config, the measured machine budget, and stage() live in loops-lib.sh.
 # Anything project-specific — how to build, how to test — goes in .loop-notes.md.
@@ -59,6 +60,7 @@ source "$SCRIPT_DIR/loops-lib.sh" || {
 # this check for a path you have committed to your own repo.
 MUST_IGNORE+=("scripts/claude-issue-loop.sh")
 [[ -f "$SCRIPT_DIR/codex-issue-loop.sh" ]] && MUST_IGNORE+=("scripts/codex-issue-loop.sh")
+[[ -f "$SCRIPT_DIR/loops" ]] && MUST_IGNORE+=("scripts/loops")
 
 # Report the number of blocking findings that survive the LAST fix, not the one
 # the review before it counted. Worth one extra review pass here: a single-issue
@@ -376,13 +378,22 @@ resolve_context() {
 # A stage dying leaves the tree mid-edit. Throwing that away is worse than an
 # ugly commit, so it becomes a WIP commit on a pushed branch and the run prints
 # the exact command that picks up where it stopped.
+#
+# If git refuses the WIP commit or the push, the summary says so. The resume
+# preflight rejects a dirty tree, so uncommitted edits cannot be silently lost.
 bail() {
-  local stage_name="$1" why="$2" code=5
+  local stage_name="$1" why="$2" code=5 committed=1 pushed=0
   (( USAGE_LIMIT_HIT )) && code=4
+  STATUS_STAGE="$stage_name"; STATUS_REASON="$why"
   warn "#$ISSUE stopped at '$stage_name': $why"
-  commit_leftovers "wip(#$ISSUE): $stage_name stopped mid-edit — see $RUN_DIR"
+  commit_leftovers "wip(#$ISSUE): $stage_name stopped mid-edit — see $RUN_DIR" || committed=0
   if ! (( NO_PUSH )); then
-    git push -u origin "$BRANCH" >>"$LOG" 2>&1 && log "   pushed $BRANCH so nothing is stranded"
+    if git push -u origin "$BRANCH" >>"$LOG" 2>&1; then
+      pushed=1
+      log "   pushed $BRANCH so nothing committed is stranded"
+    else
+      warn "could not push $BRANCH — its latest commits exist only in this clone"
+    fi
   fi
   gh issue edit "$ISSUE" --add-label "$NEEDS_HUMAN_LABEL" >>"$LOG" 2>&1
   {
@@ -390,6 +401,10 @@ bail() {
     echo "════════ #$ISSUE STOPPED ════════"
     echo "stage:  $stage_name — $why"
     echo "branch: $BRANCH  ($(git log --oneline -1 2>/dev/null))"
+    (( committed )) \
+      || echo "tree:   git refused the WIP commit; the edits are uncommitted in this worktree — commit them before resuming"
+    (( NO_PUSH || pushed )) \
+      || echo "remote: push failed; push by hand: git push -u origin $BRANCH"
     echo "logs:   $RUN_DIR"
     report_cost
     echo
@@ -413,6 +428,7 @@ spec_gate() {
   if grep -qE '^SPEC_STATUS:[[:space:]]*BLOCKED' "$msg" \
      || head -n 40 "$SPEC" | grep -q '^## BLOCKED'; then
     log "   ⏸ BLOCKED — the spec needs a decision only you can make:"
+    STATUS_REASON="spec BLOCKED — answer it in $SPEC"; STATUS_FROM=implement
     sed -n '/^## BLOCKED/,/^## [^B]/p' "$SPEC" | head -40 | tee -a "$LOG"
     git add "$SPEC" >>"$LOG" 2>&1
     git commit -qm "spec(#$ISSUE): blocked — needs a decision" >>"$LOG" 2>&1
@@ -443,6 +459,7 @@ commit_spec() {
 # ══════════════════════════════════════════════════════════════════════════
 init_run "issue-$ISSUE"
 DIR="$RUN_DIR/$ISSUE"; mkdir -p "$DIR"
+(( DRY_RUN )) || init_status
 log "${LOOP_CLI}-issue-loop #$ISSUE — stages: ${SELECTED[*]}"
 
 if (( DRY_RUN )); then
@@ -488,6 +505,7 @@ if (( DRY_RUN )); then
 fi
 
 # ── sync: adopt or create the branch, then get it current ─────────────────
+mark_stage sync
 git fetch origin --prune >>"$LOG" 2>&1
 
 CURRENT=$(git branch --show-current)
@@ -499,10 +517,12 @@ elif git rev-parse --verify --quiet "origin/$BRANCH" >/dev/null; then
   git checkout -b "$BRANCH" "origin/$BRANCH" >>"$LOG" 2>&1 \
     || { warn "cannot track origin/$BRANCH"; exit 2; }
 else
-  log "   creating $BRANCH from $BASE_BRANCH"
-  git checkout "$BASE_BRANCH" >>"$LOG" 2>&1 || { warn "cannot checkout $BASE_BRANCH"; exit 2; }
-  git pull --ff-only >>"$LOG" 2>&1
-  git checkout -b "$BRANCH" >>"$LOG" 2>&1 || { warn "cannot create $BRANCH"; exit 2; }
+  # From the fetched remote ref rather than a checkout of the base: in a
+  # worktree, the base branch is usually checked out elsewhere, and git refuses
+  # to check out one branch in two places.
+  log "   creating $BRANCH from origin/$BASE_BRANCH"
+  git checkout --no-track -b "$BRANCH" "origin/$BASE_BRANCH" >>"$LOG" 2>&1 \
+    || { warn "cannot create $BRANCH from origin/$BASE_BRANCH"; exit 2; }
 fi
 
 # Fast-forward to the remote if it moved. Divergence is a hard stop: resolving
@@ -535,6 +555,7 @@ log "   head: $(git log --oneline -1)"
 
 # ── 1. spec ───────────────────────────────────────────────────────────────
 if want spec; then
+  mark_stage spec
   if [[ -s "$SPEC" ]] && (( ! FRESH_SPEC )); then
     log "   iterating on the existing spec at $SPEC"
     SPEC_PROMPT="$(cat <<EOF
@@ -587,6 +608,7 @@ fi
 # it is a dead one — so the critique is inlined here with the interview removed
 # and the same standards kept.
 if want spec-review && (( SPEC_REVIEW_ROUNDS > 0 )); then
+  mark_stage spec-review
   [[ -s "$SPEC" ]] || bail spec-review "no spec at $SPEC to review (run the spec stage first)"
   for r in $(seq 1 "$SPEC_REVIEW_ROUNDS"); do
     stage "spec-review r$r" "$PLAN_MODEL" "$PLAN_EFFORT" "$(cat <<EOF
@@ -655,6 +677,7 @@ fi
 
 # ── 3. implement ──────────────────────────────────────────────────────────
 if want implement; then
+  mark_stage implement
   [[ -s "$SPEC" ]] || bail implement "no spec at $SPEC"
   stage "implement" "$CODE_MODEL" "$CODE_EFFORT" "$(cat <<EOF
 /implement-spec $SPEC
@@ -666,6 +689,7 @@ fi
 
 # ── 4. techdebt ───────────────────────────────────────────────────────────
 if want techdebt; then
+  mark_stage techdebt
   stage "techdebt" "$CODE_MODEL" "$CODE_EFFORT" "$(cat <<EOF
 /techdebt
 
@@ -676,14 +700,18 @@ EOF
 )" "$DIR/debt.json" || bail techdebt "the techdebt stage failed"
 fi
 
-commit_leftovers "chore(#$ISSUE): stage leftovers"
+# The resume point is the last stage that could have left these edits.
+commit_leftovers "chore(#$ISSUE): stage leftovers" \
+  || bail "$(want techdebt && echo techdebt || echo implement)" "git refused to commit the stage's edits"
 
 # ── 5. review ⇄ fix ───────────────────────────────────────────────────────
 BLOCKING=0
 REVIEWED=0
 if want review; then
+  mark_stage review
   REVIEWED=1
-  review_fix_cycle "$ISSUE" "$DIR" "$SPEC" "$BASE_BRANCH"
+  review_fix_cycle "$ISSUE" "$DIR" "$SPEC" "$BASE_BRANCH" \
+    || bail review "git refused to commit a review round's fixes"
   if (( BLOCKING == 0 )); then
     gh issue edit "$ISSUE" --remove-label "$NEEDS_HUMAN_LABEL" >>"$LOG" 2>&1 \
       && log "   cleared $NEEDS_HUMAN_LABEL on issue #$ISSUE"
@@ -701,18 +729,24 @@ fi
 # ── 6. context ────────────────────────────────────────────────────────────
 # Do not document or publish a branch whose review is incomplete. A resumed
 # `--from review` run will review the fixes, update context, and then open the PR.
+CONTEXT_RAN=0
 if want context && ! (( USAGE_LIMIT_HIT )) && (( BLOCKING == 0 )); then
+  mark_stage context
+  CONTEXT_RAN=1
   run_update_context "$ISSUE" "$DIR" "$SPEC" \
-    || bail context "the context update stage failed"
+    || bail context "the context update stage failed, or git refused to commit its edits"
 fi
 
 # Capture context edits before PR generation so the published diff and
-# description include the final documentation.
-commit_leftovers "chore(#$ISSUE): final leftovers"
+# description include the final documentation. Resume from review unless
+# context ran: a `--from context` resume would skip an unfinished review.
+commit_leftovers "chore(#$ISSUE): final leftovers" \
+  || bail "$( (( CONTEXT_RAN )) && echo context || echo review)" "git refused to commit the final edits"
 
 # ── 7. PR ─────────────────────────────────────────────────────────────────
 PR_NUM=""; PR_URL=""; BRANCH_PUSHED=0
 if want pr && ! (( USAGE_LIMIT_HIT )) && (( BLOCKING == 0 )); then
+  mark_stage pr
   if want implement && \
      [[ -z "$(git diff --name-only "origin/$BASE_BRANCH...HEAD" -- . ":!$SPEC")" ]]; then
     bail pr "no implementation landed — the branch is only the spec"
@@ -770,17 +804,30 @@ EOF
 fi
 
 # Keep a recoverable remote branch even when review findings prevented the PR.
-# `--no-push` is the explicit local-only exception.
+# `--no-push` is the explicit local-only exception. A failed push fails the
+# run: the remote would otherwise lack this run's commits while the exit code
+# reported success. It does not go through bail(), whose single resume hint
+# would replace the review verdict the summary below still reports correctly.
+PUSH_FAILED=0
 if ! (( NO_PUSH || BRANCH_PUSHED )); then
   if git push -u origin "$BRANCH" >>"$LOG" 2>&1; then
     BRANCH_PUSHED=1
     log "   pushed $BRANCH for recovery"
   else
+    PUSH_FAILED=1
     warn "could not push $BRANCH — the latest branch state remains local"
+    gh issue edit "$ISSUE" --add-label "$NEEDS_HUMAN_LABEL" >>"$LOG" 2>&1
   fi
 fi
 
 # ── summary ───────────────────────────────────────────────────────────────
+# Set here, not inside the block below: a group piped into tee is a subshell.
+if (( USAGE_LIMIT_HIT )); then STATUS_REASON="account usage limit"
+elif (( BLOCKING > 0 )); then STATUS_REASON="$BLOCKING blocking finding(s) — $DIR/review-*.md"
+elif (( BLOCKING < 0 )); then STATUS_REASON="the review never returned a verdict"
+elif (( PUSH_FAILED )); then STATUS_REASON="push failed — git push -u origin $BRANCH"
+fi
+
 # Deliberately no `return_to_base`: this run produced one branch and you are
 # almost certainly about to look at it. Leaving you on it also keeps the
 # `git clean -fd` inside reset_tree away from a tree it has no reason to touch.
@@ -795,7 +842,7 @@ fi
   elif (( BRANCH_PUSHED )); then
     echo "remote: pushed to origin"
   else
-    echo "remote: push failed; the latest branch state may exist only locally"
+    echo "remote: push failed; the latest commits exist only locally — git push -u origin $BRANCH"
   fi
   echo "spec:   $SPEC"
   [[ -n "$PR_URL" ]] && echo "PR:     $PR_URL"
@@ -818,6 +865,10 @@ fi
     echo "UNVERIFIED — the review never returned a verdict. Read $DIR/review-*.md."
     echo "Resolve the review failure, then resume with:"
     echo "  ./scripts/${LOOP_SCRIPT} $ISSUE --from review"
+  elif (( PUSH_FAILED )); then
+    echo "NOT PUSHED — the review came back clean, but origin does not have the"
+    echo "final commits. Check the network and your git credentials, then run:"
+    echo "  git push -u origin $BRANCH"
   elif [[ -z "$PR_URL" ]]; then
     echo "Review came back clean. No PR was opened because the pr stage was not selected."
   else
@@ -829,5 +880,6 @@ fi
 } | tee -a "$LOG"
 
 (( USAGE_LIMIT_HIT )) && exit 4
+(( PUSH_FAILED )) && exit 5
 (( BLOCKING != 0 )) && exit 3
 exit 0

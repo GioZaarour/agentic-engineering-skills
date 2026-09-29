@@ -36,6 +36,9 @@ if prompt.startswith(('/implement-spec', '$implement-spec')):
 fixed = pathlib.Path(os.environ['CALLS'] + '.fixed')
 if prompt.startswith('The full branch review is at'):
     fixed.touch()
+    pathlib.Path('fix.txt').write_text('review fix fixture\n')
+if prompt.startswith(('/update-context', '$update-context')):
+    pathlib.Path('context.txt').write_text('context fixture\n')
 if 'BLOCKING:' in prompt:
     blocking = int(os.environ.get('FAKE_REVIEW') == 'blocked' or
                    (os.environ.get('FAKE_REVIEW') == 'fix' and not fixed.exists()))
@@ -72,6 +75,14 @@ if sys.argv[1:3] == ['pr', 'view']:
     print('https://example.invalid/pr/42' if sys.argv[-1] == '.url' else '42')
 '''
 
+FAKE_TMUX = r'''#!/usr/bin/env python3
+import json, os, sys
+if sys.argv[1] == 'has-session':
+    sys.exit(0 if sys.argv[-1] == '=repo-21' else 1)
+with open(os.environ['CALLS'] + '.tmux', 'a') as f:
+    f.write(json.dumps(sys.argv[1:]) + '\n')
+'''
+
 
 class IssueLoopTests(unittest.TestCase):
     def setUp(self):
@@ -82,7 +93,8 @@ class IssueLoopTests(unittest.TestCase):
         self.repo.mkdir()
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        for name, content in (("claude", FAKE_CLI), ("codex", FAKE_CLI), ("gh", FAKE_GH)):
+        for name, content in (("claude", FAKE_CLI), ("codex", FAKE_CLI), ("gh", FAKE_GH),
+                              ("tmux", FAKE_TMUX)):
             path = self.bin / name
             path.write_text(content)
             path.chmod(0o755)
@@ -99,8 +111,8 @@ class IssueLoopTests(unittest.TestCase):
         self.git("add", "scripts")
         self.git("commit", "-qm", "fixture")
 
-    def run_cmd(self, *args, **env):
-        return subprocess.run(args, cwd=self.repo, env=dict(self.env, **env), text=True,
+    def run_cmd(self, *args, cwd=None, **env):
+        return subprocess.run(args, cwd=cwd or self.repo, env=dict(self.env, **env), text=True,
                               capture_output=True, timeout=20)
 
     def git(self, *args):
@@ -110,6 +122,21 @@ class IssueLoopTests(unittest.TestCase):
 
     def shell(self, code, **env):
         return self.run_cmd(BASH, "-c", 'source scripts/loops-lib.sh\n' + code, **env)
+
+    def add_remote(self):
+        remote = self.root / "origin.git"
+        self.git("init", "--bare", "-q", str(remote))
+        self.git("remote", "add", "origin", str(remote))
+        self.git("push", "-qu", "origin", "main")
+        return remote
+
+    def reject_commits_of(self, name):
+        hook = self.repo / ".git/hooks/pre-commit"
+        hook.write_text(f'#!/bin/sh\ngit diff --cached --name-only | grep -qx {name} && exit 1\nexit 0\n')
+        hook.chmod(0o755)
+
+    def statuses(self):
+        return [json.loads(p.read_text()) for p in sorted((self.repo / ".git/loops").glob("*.json"))]
 
     def calls(self):
         path = Path(self.env["CALLS"])
@@ -199,10 +226,7 @@ exit "$rc"
         self.assertEqual(self.calls(), [])
 
     def test_full_local_workflow_uses_phase_efforts(self):
-        remote = self.root / "origin.git"
-        self.git("init", "--bare", "-q", str(remote))
-        self.git("remote", "add", "origin", str(remote))
-        self.git("push", "-qu", "origin", "main")
+        self.add_remote()
         for cli in ("claude", "codex"):
             with self.subTest(cli=cli):
                 Path(self.env["CALLS"] + ".fixed").unlink(missing_ok=True)
@@ -224,18 +248,172 @@ exit "$rc"
                 self.assertIn("https://example.invalid/pr/42", result.stdout)
                 self.assertTrue((self.repo / "implemented.txt").exists())
                 self.assertEqual(self.git("status", "--porcelain"), "")
+                status = self.statuses()[-1]
+                self.assertEqual((status["cli"], status["state"], status["stage"], status["exit_code"]),
+                                 (cli, "done", "pr", 0))
+                self.assertEqual(status["pr"], "https://example.invalid/pr/42")
 
     def test_codex_resume_hint_after_unresolved_review(self):
-        remote = self.root / "origin.git"
-        self.git("init", "--bare", "-q", str(remote))
-        self.git("remote", "add", "origin", str(remote))
-        self.git("push", "-qu", "origin", "main")
+        self.add_remote()
         result = self.run_cmd(BASH, "scripts/codex-issue-loop.sh", "19", "--no-push",
                               "--no-adopt", "--stages", "review", FAKE_REVIEW="blocked",
                               MAX_REVIEW_ROUNDS="1")
         self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
         self.assertIn("./scripts/codex-issue-loop.sh 19 --from review", result.stdout)
         self.assertNotIn("./scripts/claude-issue-loop.sh 19 --from review", result.stdout)
+        status = self.statuses()[-1]
+        self.assertEqual((status["cli"], status["state"], status["from"]), ("codex", "needs-human", "review"))
+        self.assertIn("1 blocking", status["reason"])
+
+    def test_commit_leftovers_reports_git_failure(self):
+        code = '''
+RUN_DIR="$PWD/run"; mkdir -p "$RUN_DIR"; LOG="$RUN_DIR/run.log"
+commit_leftovers "clean tree" || exit 10
+echo kept > kept.txt
+commit_leftovers "kept" || exit 11
+echo rejected > rejected.txt
+commit_leftovers "rejected"
+'''
+        self.reject_commits_of("rejected.txt")
+        result = self.shell(code)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("could not commit", result.stderr)
+        self.assertEqual(self.git("log", "-1", "--format=%s"), "kept")
+        self.assertIn("rejected.txt", self.git("status", "--porcelain"))
+
+    def test_rejected_leftover_commit_stops_the_run(self):
+        # Each file is written by a different stage and committed by a different
+        # commit_leftovers call; the run must stop at the stage that wrote it.
+        self.add_remote()
+        for name, stage in (("implemented.txt", "techdebt"), ("fix.txt", "review"),
+                            ("context.txt", "context")):
+            with self.subTest(stage=stage):
+                # Start each stage from main with no branch left by the previous one.
+                self.git("checkout", "-qf", "main")
+                self.git("clean", "-qfd")
+                self.run_cmd("git", "branch", "-qD", "v0/feature/19-add-fixture")
+                self.run_cmd("git", "push", "-q", "origin", ":v0/feature/19-add-fixture")
+                Path(self.env["CALLS"] + ".fixed").unlink(missing_ok=True)
+                self.reject_commits_of(name)
+                result = self.run_cmd(BASH, "scripts/claude-issue-loop.sh", "19",
+                                      "--no-adopt", "--fresh-spec",
+                                      FAKE_REVIEW="fix", MAX_REVIEW_ROUNDS="1")
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 5, output)
+                self.assertIn(f"stopped at '{stage}'", output)
+                self.assertIn("uncommitted", result.stdout)
+                self.assertIn(f"claude-issue-loop.sh 19 --from {stage}", result.stdout)
+                self.assertNotIn("complete ════", result.stdout)
+                self.assertIn(name, self.git("status", "--porcelain"))
+                status = self.statuses()[-1]
+                self.assertEqual((status["state"], status["from"], status["exit_code"]),
+                                 ("failed", stage, 5))
+
+    def test_final_push_failure_is_not_success(self):
+        remote = self.add_remote()
+        hook = remote / "hooks/pre-receive"
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        result = self.run_cmd(BASH, "scripts/claude-issue-loop.sh", "19",
+                              "--no-adopt", "--fresh-spec", "--skip", "pr")
+        self.assertEqual(result.returncode, 5, result.stdout + result.stderr)
+        self.assertIn("push failed", result.stdout)
+        self.assertIn("git push -u origin v0/feature/19-add-fixture", result.stdout)
+        self.assertNotIn("Review came back clean", result.stdout)
+
+    def test_dry_run_is_not_registered(self):
+        self.run_cmd(BASH, "scripts/claude-issue-loop.sh", "19", "--dry-run", "--no-adopt")
+        self.assertEqual(self.statuses(), [])
+
+    def test_killed_run_records_its_stage(self):
+        self.add_remote()
+        sleeper = self.bin / "claude"
+        sleeper.write_text(FAKE_CLI.replace("mode = os.environ", "import time\n"
+                           "if prompt.startswith('/implement-spec'): time.sleep(2)\nmode = os.environ"))
+        proc = subprocess.Popen([BASH, "scripts/claude-issue-loop.sh", "19", "--no-adopt", "--fresh-spec"],
+                                cwd=self.repo, env=self.env, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        for _ in range(100):
+            if any(s["stage"] == "implement" for s in self.statuses()):
+                break
+            subprocess.run(["sleep", "0.1"])
+        proc.terminate()
+        proc.wait(timeout=20)
+        status = self.statuses()[-1]
+        self.assertEqual((status["state"], status["stage"], status["from"]), ("killed", "implement", "implement"))
+
+    def test_loop_runs_in_a_worktree_beside_others(self):
+        self.add_remote()
+        wt = self.root / "wt-19"
+        self.git("worktree", "add", "-q", "--detach", str(wt), "origin/main")
+        self.git("worktree", "add", "-q", "--detach", str(self.root / "wt-other"), "origin/main")
+        result = self.run_cmd(BASH, "scripts/claude-issue-loop.sh", "19", "--no-adopt",
+                              "--fresh-spec", "--no-push", cwd=wt)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.run_cmd("git", "branch", "--show-current", cwd=wt).stdout.strip(),
+                         "v0/feature/19-add-fixture")
+        self.assertEqual(self.statuses()[-1]["worktree"], str(wt.resolve()))
+
+    def test_nested_worktree_still_fails_preflight(self):
+        self.add_remote()
+        self.git("worktree", "add", "-q", "--detach", str(self.repo / "nested"), "origin/main")
+        (self.repo / ".git/info/exclude").write_text(".loops\nnested\n")
+        result = self.run_cmd(BASH, "scripts/claude-issue-loop.sh", "19", "--no-adopt")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("inside this checkout", result.stderr)
+
+    def write_status(self, run_id, **fields):
+        registry = self.repo / ".git/loops"
+        registry.mkdir(exist_ok=True)
+        status = dict(issue=19, cli="claude", state="running", stage="implement", reason="", **{"from": ""},
+                      branch="", base="main", pr="", tmux="", worktree=str(self.repo),
+                      log="/logs/run.log", pid=os.getpid(), started=0, updated=0, exit_code=None)
+        status.update(fields)
+        (registry / f"{run_id}.json").write_text(json.dumps(status))
+
+    def test_loops_status_shows_latest_run_per_issue(self):
+        self.add_remote()
+        self.git("checkout", "-qb", "b19")
+        self.git("commit", "-q", "--allow-empty", "-m", "one")
+        self.git("commit", "-q", "--allow-empty", "-m", "two")
+        self.write_status("1-issue-19", state="done", started=1)
+        self.write_status("2-issue-19", cli="codex", state="limit", stage="review", branch="b19",
+                          reason="account usage limit", started=2, exit_code=4, **{"from": "review"})
+        self.write_status("3-issue-21", issue=21, pid=2**22 + 1, started=3, **{"from": "implement"})
+        self.write_status("4-issue-24", issue=24, tmux="repo-24", started=4)
+        out = self.run_cmd(BASH, "scripts/loops", "status").stdout
+        rows = {line.split()[0]: line for line in out.splitlines() if line.startswith("#")}
+        self.assertEqual(out.count("#19 "), 1, out)
+        self.assertRegex(rows["#19"], r"codex\s+review\s+limit\s+2\s")
+        self.assertIn("loops run --cli codex 19 -- --from review", rows["#19"])
+        self.assertIn("account usage limit", out)
+        self.assertIn("died", rows["#21"])
+        self.assertIn("loops run 21 -- --from implement", rows["#21"])
+        self.assertIn("running", rows["#24"])
+        self.assertIn("tmux attach -t repo-24", rows["#24"])
+        self.assertEqual(self.run_cmd(BASH, "scripts/loops", "status", "--all").stdout.count("#19 "), 2)
+
+    def test_loops_run_starts_one_worktree_and_session_per_issue(self):
+        self.add_remote()
+        other = self.root / "elsewhere"
+        self.write_status("1-issue-24", issue=24, state="limit", worktree=str(other))
+        other.mkdir()
+        result = self.run_cmd(BASH, "scripts/loops", "run", "--cli", "codex", "19", "21", "24",
+                              "--", "--no-push", PLAN_MODEL="fable")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("#21 is already running", result.stdout)
+        calls = [json.loads(l) for l in Path(self.env["CALLS"] + ".tmux").read_text().splitlines()]
+        self.assertEqual(len(calls), 2)
+        wt = (self.root / "repo-loops/issue-19").resolve()
+        self.assertEqual(self.run_cmd("git", "rev-parse", "HEAD", cwd=wt).stdout,
+                         self.run_cmd("git", "rev-parse", "origin/main").stdout)
+        new19, new24 = calls
+        self.assertEqual(new19[:5], ["new-session", "-d", "-s", "repo-19", "-c"])
+        self.assertEqual(Path(new19[5]).resolve(), wt)
+        self.assertIn("PLAN_MODEL=fable", new19)
+        self.assertRegex(new19[-1], r"codex-issue-loop\.sh 19 --no-push\s*$")
+        self.assertEqual(new24[5], str(other))
+        self.assertFalse((self.root / "repo-loops/issue-21").exists())
 
 
 if __name__ == "__main__":
