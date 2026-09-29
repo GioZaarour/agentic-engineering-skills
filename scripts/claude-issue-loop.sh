@@ -72,9 +72,13 @@ FINAL_VERIFY_REVIEW="${ISSUE_LOOP_FINAL_VERIFY:-1}"
 STAGE_ORDER=(spec spec-review implement techdebt review context pr)
 
 # The fallback matcher selects existing branches and specs from lists of names.
-# Claude uses Sonnet here; Codex uses its default model, both at medium effort.
+# Claude uses Haiku without an effort flag; Codex uses Luna at medium effort.
 ADOPT_MODEL="${ADOPT_MODEL:-$DEFAULT_ADOPT_MODEL}"
-ADOPT_EFFORT="${ADOPT_EFFORT:-medium}"
+if [[ "$LOOP_CLI" == claude && "$ADOPT_MODEL" == claude-haiku-* ]]; then
+  ADOPT_EFFORT="${ADOPT_EFFORT:-}"
+else
+  ADOPT_EFFORT="${ADOPT_EFFORT:-medium}"
+fi
 
 usage() {
   cat <<EOF

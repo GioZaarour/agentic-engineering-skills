@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# loops — run issue loops in parallel, one git worktree and one tmux session
-# per issue, and show where every run in this repo got to.
+# loops — run issue loops in tmux, using the current checkout when it is already
+# on the issue branch and a dedicated worktree otherwise.
 #
 #   ./scripts/loops run 19 21 24                   # Claude, three loops at once
 #   ./scripts/loops run --cli codex 24 -- --no-push  # args after -- go to each loop
@@ -69,11 +69,11 @@ cmd_status() {
   done < <(runs "$all")
 }
 
-# Starts each issue in its own tmux session. A resumed issue reuses the
-# worktree its last run used; a new one gets a detached worktree at the tip of
-# origin/<base>, and the loop creates or adopts the issue's branch in it.
+# A numbered issue branch in the invoking checkout is an explicit choice to
+# work there. All other runs use the issue's dedicated worktree, including runs
+# whose older status record points at an unrelated checkout.
 cmd_run() {
-  local cli=claude n wt session rc=0 var
+  local cli=claude n wt session rc=0 var current_root current_branch
   local -a issues=() pass=() env_args=()
   while (( $# )); do
     case "$1" in
@@ -86,6 +86,8 @@ cmd_run() {
   [[ "$cli" == claude || "$cli" == codex ]] || { echo "--cli must be claude or codex" >&2; return 2; }
   (( ${#issues[@]} )) || { usage >&2; return 2; }
   command -v tmux >/dev/null || { echo "tmux is required" >&2; return 2; }
+  current_root="$(git rev-parse --show-toplevel)" || return 2
+  current_branch="$(git branch --show-current)" || return 2
 
   # A session started by a running tmux server inherits the server's
   # environment, not this shell's. Forward PATH and every loop setting that is
@@ -101,11 +103,18 @@ cmd_run() {
     if tmux has-session -t "=$session" 2>/dev/null; then
       echo "#$n is already running — tmux attach -t $session"; continue
     fi
-    wt=$(jq -rs --argjson n "$n" 'map(select(.issue == $n)) | sort_by(.started) | last | .worktree // empty' \
-         "$REGISTRY"/*.json 2>/dev/null)
-    [[ -n "$wt" && -d "$wt" ]] || wt="$WORKTREE_ROOT/issue-$n"
-    if [[ ! -d "$wt" ]] && ! git worktree add -q --detach "$wt" "origin/$BASE_BRANCH"; then
-      echo "#$n: cannot create worktree $wt" >&2; rc=1; continue
+    if [[ "$current_branch" =~ (^|/)$n[-_] ]]; then
+      wt="$current_root"
+    else
+      wt="$WORKTREE_ROOT/issue-$n"
+      if [[ -e "$wt" ]]; then
+        if [[ "$(git -C "$wt" rev-parse --show-toplevel 2>/dev/null)" != "$(cd "$wt" && pwd -P)" ]] \
+           || [[ "$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" != "$COMMON_DIR" ]]; then
+          echo "#$n: $wt exists but is not this repo's dedicated worktree" >&2; rc=1; continue
+        fi
+      elif ! git worktree add -q --detach "$wt" "origin/$BASE_BRANCH"; then
+        echo "#$n: cannot create worktree $wt" >&2; rc=1; continue
+      fi
     fi
     tmux new-session -d -s "$session" -c "$wt" "${env_args[@]}" \
       "$(printf '%q ' "$SCRIPT_DIR/$cli-issue-loop.sh" "$n" ${pass[@]+"${pass[@]}"})" \

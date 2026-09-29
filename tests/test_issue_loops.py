@@ -161,6 +161,19 @@ exit "$rc"
                                             PLAN_EFFORT="medium", CODE_EFFORT="low").stdout,
                                  "plan medium code low")
 
+    def test_adoption_uses_small_models(self):
+        for cli, model in (("claude", "claude-haiku-4-5-20251001"),
+                           ("codex", "gpt-6-luna")):
+            with self.subTest(cli=cli):
+                result = self.run_cmd(BASH, f"scripts/{cli}-issue-loop.sh", "19", "--dry-run")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                args = self.calls()[-1]["args"]
+                self.assertEqual(args[args.index("--model") + 1], model)
+                if cli == "claude":
+                    self.assertNotIn("--effort", args)
+                else:
+                    self.assertIn('model_reasoning_effort="medium"', args)
+
     def test_cli_arguments_and_result(self):
         for cli in ("claude", "codex"):
             with self.subTest(cli=cli):
@@ -395,9 +408,9 @@ commit_leftovers "rejected"
 
     def test_loops_run_starts_one_worktree_and_session_per_issue(self):
         self.add_remote()
-        other = self.root / "elsewhere"
-        self.write_status("1-issue-24", issue=24, state="limit", worktree=str(other))
-        other.mkdir()
+        other = self.root / "repo-loops/issue-24"
+        self.git("worktree", "add", "-q", "--detach", str(other), "origin/main")
+        self.write_status("1-issue-24", issue=24, state="limit", worktree=str(self.repo))
         result = self.run_cmd(BASH, "scripts/loops", "run", "--cli", "codex", "19", "21", "24",
                               "--", "--no-push", PLAN_MODEL="fable")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -412,8 +425,26 @@ commit_leftovers "rejected"
         self.assertEqual(Path(new19[5]).resolve(), wt)
         self.assertIn("PLAN_MODEL=fable", new19)
         self.assertRegex(new19[-1], r"codex-issue-loop\.sh 19 --no-push\s*$")
-        self.assertEqual(new24[5], str(other))
+        self.assertEqual(Path(new24[5]).resolve(), other.resolve())
         self.assertFalse((self.root / "repo-loops/issue-21").exists())
+
+    def test_loops_run_uses_current_checkout_only_for_matching_issue_branch(self):
+        self.add_remote()
+        self.git("checkout", "-qb", "v1/bugfix/19-existing")
+        self.write_status("old-19", state="done", worktree=str(self.root / "elsewhere"))
+        result = self.run_cmd(BASH, "scripts/loops", "run", "19", "190")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = [json.loads(line) for line in Path(self.env["CALLS"] + ".tmux").read_text().splitlines()]
+        self.assertEqual(Path(calls[0][5]).resolve(), self.repo.resolve())
+        self.assertEqual(Path(calls[1][5]).resolve(), (self.root / "repo-loops/issue-190").resolve())
+
+    def test_loops_run_ignores_recorded_main_checkout_after_branch_changes(self):
+        self.add_remote()
+        self.write_status("old-19", state="done", worktree=str(self.repo))
+        result = self.run_cmd(BASH, "scripts/loops", "run", "19")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        call = json.loads(Path(self.env["CALLS"] + ".tmux").read_text().splitlines()[-1])
+        self.assertEqual(Path(call[5]).resolve(), (self.root / "repo-loops/issue-19").resolve())
 
 
 if __name__ == "__main__":

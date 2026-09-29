@@ -208,7 +208,7 @@ Everything is an environment variable with a sane default; there is no config fi
 | `PLAN_MODEL` | Claude: `claude-opus-5-5`; Codex: `gpt-6-sol` | Spec derivation, spec review, branch review |
 | `CODE_MODEL` | Claude: `claude-opus-5-5`; Codex: `gpt-6-sol` | Implementation, techdebt, fixes, context |
 | `PLAN_EFFORT` / `CODE_EFFORT` | `high` / `medium` | Planning and review effort / implementation, fixes, cleanup, context, and PR-writing effort |
-| `ADOPT_MODEL` / `ADOPT_EFFORT` | Claude: `claude-sonnet-5` / `medium`; Codex: `gpt-6-sol` / `medium` | Read-only fallback for branches and specs with unconventional names |
+| `ADOPT_MODEL` / `ADOPT_EFFORT` | Claude: `claude-haiku-4-5-20251001` / unset; Codex: `gpt-6-luna` / `medium` | Read-only fallback for branches and specs with unconventional names. Haiku does not support the effort flag. |
 | `LOOP_AUTH` | `subscription` | Claude only: which credentials every stage bills to. `subscription` unsets `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` for the run, because `claude` prefers an exported key over your claude.ai login, and preflight then stops the run unless `claude auth status` reports subscription billing. That catches an `apiKeyHelper`, a Console login, and no login at all. Set `api-key` to bill the API key instead. |
 | `BASE_BRANCH` | `main` | What the PR targets, and what new branches are cut from. Set it to an unmerged branch to stack work on top of it. |
 | `VERSION_SEGMENT` | `v0` | The first path segment in branch and spec names |
@@ -234,7 +234,7 @@ Two more places the loop guesses, both of which the `--dry-run` shows you: the *
 
 ### Running loops in parallel
 
-`scripts/loops` runs several issue loops at the same time on one machine. It gives each issue its own git worktree and its own tmux session, then reports the state of every loop run in the repository with one command.
+`scripts/loops` runs several issue loops at the same time on one machine. It uses the invoking checkout when its branch name contains the issue number as a path segment prefix, such as `v1/bugfix/19-fix-race`; otherwise it uses a dedicated worktree for that issue. Each run gets its own tmux session, and the command reports the state of every loop run in the repository.
 
 The loops do not coordinate with each other. Choose issues that change separate parts of the codebase. Two loops that edit the same files each produce a PR, and those PRs conflict.
 
@@ -256,8 +256,8 @@ PLAN_MODEL=claude-fable-5-1 ./scripts/loops run 30 31   # settings apply to ever
 For each issue number, `loops run` does the following:
 
 1. It names the tmux session `<repo>-<N>`, for example `myapp-19`. If a session with that name exists, it skips the issue and prints the `tmux attach` command.
-2. It chooses a worktree. If an earlier run of the issue used a worktree that still exists, it reuses that worktree. Otherwise it creates a new worktree at `../<repo>-loops/issue-<N>`, detached at `origin/<BASE_BRANCH>`. Set `LOOPS_WORKTREE_ROOT` to create new worktrees somewhere else.
-3. It starts `<cli>-issue-loop.sh <N>` in the new session, inside that worktree. The loop then creates or adopts the issue's branch, exactly as a single run does.
+2. It checks the branch in the invoking checkout. If it matches the issue number, the loop runs there. Otherwise it uses `../<repo>-loops/issue-<N>`, reusing that dedicated worktree if it exists or creating it detached at `origin/<BASE_BRANCH>`. Earlier status records do not select a checkout. Set `LOOPS_WORKTREE_ROOT` to put dedicated worktrees somewhere else.
+3. It starts `<cli>-issue-loop.sh <N>` in the new session, inside the selected checkout. The loop then creates or adopts the issue's branch, exactly as a single run does.
 
 Some details affect how you call it:
 
@@ -312,7 +312,7 @@ Status records are never deleted automatically. When you remove a worktree, its 
 
 #### Resume a stopped loop
 
-Run the command in the `NEXT` column. It reuses the issue's worktree, starts a new session, and passes `--from <stage>` to the loop. The command includes `--cli codex` when the stopped run used Codex.
+Run the command in the `NEXT` column. It uses the invoking checkout if you are on the issue branch; otherwise it uses the issue's dedicated worktree. It starts a new session and passes `--from <stage>` to the loop. The command includes `--cli codex` when the stopped run used Codex.
 
 For `needs-human`, fix the problem before you resume:
 
@@ -347,7 +347,7 @@ Parallel loops share the machine, the git repository, and your accounts. The loo
 - **CPU and RAM:** Each loop measures the whole machine and sets its build parallelism and subagent count as if it were the only loop (see [Configuration](#configuration)). Three loops on one machine therefore ask for three times the machine's capacity. Divide the budget yourself, for example `BUILD_JOBS=2 SUBAGENT_CAP_OVERRIDE=1 ./scripts/loops run 19 21 24`.
 - **Disk:** Each worktree holds its own build artifacts. Each loop checks `MIN_DISK_GB` once, at its own start, against the free disk at that time. Stages that create their own worktrees multiply the disk use again. Set `ALLOW_WORKTREES_OVERRIDE=no` when disk is limited.
 - **Usage limits:** All Claude loops draw on the same subscription. All Codex loops draw on the same Codex account. When one loop reaches the limit, the others usually reach it soon after. When the limit resets, resume each `limit` loop from `status`.
-- **Branches:** git checks out a branch in only one worktree at a time. If an issue's branch is checked out in your main checkout, that loop fails at `sync` with `cannot checkout`. Switch the main checkout to another branch, then resume.
+- **Branches:** git checks out a branch in only one worktree at a time. If the issue branch is checked out in another checkout, run `loops` from that checkout or switch it to another branch before starting the dedicated worktree.
 - **Worktree location:** Preflight refuses to start when a worktree is nested inside the loop's checkout, because `git add -A` would commit it as an embedded repository. The default location, `../<repo>-loops/`, is outside the checkout. Keep `LOOPS_WORKTREE_ROOT` outside it too.
 - **Fetches:** Every loop runs `git fetch` in the same repository. Two fetches at the same moment can fail to lock a ref. The loop logs the error and continues with the refs it already has.
 

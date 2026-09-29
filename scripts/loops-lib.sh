@@ -53,7 +53,7 @@ LOOP_CLI="${LOOP_CLI:-claude}"
 case "$LOOP_CLI" in
   claude)
     DEFAULT_MODEL=claude-opus-5-5
-    DEFAULT_ADOPT_MODEL=claude-sonnet-5
+    DEFAULT_ADOPT_MODEL=claude-haiku-4-5-20251001
     # Prefer the subscription even when a shell profile exports an API key.
     LOOP_AUTH="${LOOP_AUTH:-subscription}"
     case "$LOOP_AUTH" in
@@ -64,7 +64,7 @@ case "$LOOP_CLI" in
     ;;
   codex)
     DEFAULT_MODEL=gpt-6-sol
-    DEFAULT_ADOPT_MODEL=gpt-6-sol
+    DEFAULT_ADOPT_MODEL=gpt-6-luna
     ;;
   *) echo "unknown loop CLI: $LOOP_CLI" >&2; exit 2 ;;
 esac
