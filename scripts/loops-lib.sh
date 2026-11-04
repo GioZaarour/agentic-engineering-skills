@@ -560,9 +560,13 @@ stage() {
     # Retrying into an exhausted account burns an hour of backoff and a dozen
     # pointless API calls re-confirming the same 429 across every remaining
     # stage. Stop the run instead, with the branch left recoverable. An empty
-    # API-key balance is the same situation arriving as a 400.
+    # API-key balance is the same situation arriving as a 400. Match on the
+    # machine-readable .api_error as well as the prose: a subscription's
+    # rolling window reads "You've hit your 5-hour limit", which names no
+    # "usage limit", while .api_error says usage_limit_reached.
     if jq -e '(.is_error == true) and (.api_error_status == 429 or .api_error_status == 400 or .provider == "codex")
-              and ((.result // "") | test("spend limit|usage limit|rate limit|credit balance|quota|usage_limit|rate_limit"; "i"))' \
+              and (((.api_error // "" | tostring) + " " + (.result // ""))
+                   | test("spend limit|usage limit|rate limit|credit balance|quota|usage_limit|rate_limit|hit your .*limit"; "i"))' \
          "$out" >/dev/null 2>&1; then
       warn "$label: $(jq -r '.result' "$out" 2>/dev/null | head -1)"
       warn "ACCOUNT LIMIT REACHED — aborting; remaining work is untouched"

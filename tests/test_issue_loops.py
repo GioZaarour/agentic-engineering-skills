@@ -48,9 +48,14 @@ if 'The FIRST LINE of that file is the PR title' in prompt:
     pathlib.Path(path).write_text('Fixture PR\n\nFixture description\n')
 if mode == 'limit':
     result = 'You have hit your usage limit'
+api_error = None
+if mode == 'window-limit':
+    # The subscription's rolling-window 429, verbatim from a real run.
+    result = "You've hit your 5-hour limit · resets 10:20pm (UTC)"
+    api_error = 'usage_limit_reached'
 if cli == 'claude':
-    print(json.dumps(dict(result=result, is_error=mode != 'success',
-                         api_error_status=429 if mode == 'limit' else None)))
+    print(json.dumps(dict(result=result, is_error=mode != 'success', api_error=api_error,
+                         api_error_status=429 if mode in ('limit', 'window-limit') else None)))
 else:
     output = pathlib.Path(args[args.index('--output-last-message') + 1])
     if mode != 'empty':
@@ -270,6 +275,10 @@ printf '%s' "$RESOURCE_NOTE"
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("LIMIT=1", result.stdout)
             self.assertEqual(len(self.calls()), before + 1)
+        before = len(self.calls())
+        result = self.stage("claude", FAKE_MODE="window-limit", MAX_ATTEMPTS="3")
+        self.assertIn("LIMIT=1", result.stdout)
+        self.assertEqual(len(self.calls()), before + 1)
         before = len(self.calls())
         self.stage(FAKE_MODE="timeout", MAX_ATTEMPTS="3")
         self.assertEqual(len(self.calls()), before + 1)
