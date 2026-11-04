@@ -328,8 +328,12 @@ ${tight_line:+$tight_line
   message instead of skipping it silently.
 - Do not run \`git push\`, do not open or merge PRs, and do not run
   \`git clean\` — the orchestrating shell owns all of those.
-- Do not edit anything under \`${RUN_ROOT}/\` or \`scripts/\` — that is the loop
-  driving you, not the code under change.
+- Do not edit anything under \`${RUN_ROOT}/\`, or the loop driver itself:
+  \`scripts/claude-issue-loop.sh\`, \`scripts/codex-issue-loop.sh\`,
+  \`scripts/loops\`, \`scripts/loops-lib.sh\`, and \`test_issue_loops.py\`
+  wherever this repo keeps it. That is the loop driving you, not the code
+  under change. Every other file under \`scripts/\` is ordinary project code;
+  edit it when the spec asks.
 EOF
 
   # Whatever the project needs said about itself, said once, in every prompt.
