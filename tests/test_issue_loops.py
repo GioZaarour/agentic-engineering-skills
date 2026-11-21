@@ -21,7 +21,8 @@ if args == ['auth', 'status']:
     sys.exit(0)
 prompt = sys.stdin.read() if cli == 'codex' else args[args.index('-p') + 1]
 with open(os.environ['CALLS'], 'a') as f:
-    f.write(json.dumps(dict(cli=cli, args=args, prompt=prompt)) + '\n')
+    f.write(json.dumps(dict(cli=cli, args=args, prompt=prompt,
+                            bg_wait=os.environ.get('CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS'))) + '\n')
 mode = os.environ.get('FAKE_MODE', 'success')
 result = 'OK'
 if 'ADOPT_BRANCH:' in prompt:
@@ -53,7 +54,9 @@ if mode == 'window-limit':
     # The subscription's rolling-window 429, verbatim from a real run.
     result = "You've hit your 5-hour limit · resets 10:20pm (UTC)"
     api_error = 'usage_limit_reached'
-if cli == 'claude':
+if cli == 'claude' and mode == 'timeout':
+    pass  # killed by `timeout`: claude writes its result only on a clean exit
+elif cli == 'claude':
     print(json.dumps(dict(result=result, is_error=mode != 'success', api_error=api_error,
                          api_error_status=429 if mode in ('limit', 'window-limit') else None)))
 else:
@@ -122,7 +125,8 @@ class IssueLoopTests(unittest.TestCase):
                     "STAGE_BUDGET_USD", "TOTAL_BUDGET_USD", "FAKE_MODE", "LOOPS_SHARE",
                     "BUILD_JOBS", "SUBAGENT_CAP_OVERRIDE", "ALLOW_WORKTREES_OVERRIDE", "MB_PER_JOB",
                     "LOOPS_MEMORY_MAX", "LOOPS_MEMORY_RESERVE_MB", "LOOPS_SLICE",
-                    "LOOPS_WORKTREE_PARENT", "LOOPS_WORKTREE_ROOT"):
+                    "LOOPS_WORKTREE_PARENT", "LOOPS_WORKTREE_ROOT",
+                    "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"):
             self.env.pop(key, None)
         self.git("init", "-q", "-b", "main")
         self.git("config", "user.name", "Loop Test")
@@ -255,6 +259,18 @@ printf '%s' "$RESOURCE_NOTE"
                     self.assertIn("--effort", call["args"])
                     self.assertTrue(call["prompt"].startswith("/branch-review"))
 
+    def test_claude_stage_waits_for_background_subagents_without_a_limit(self):
+        # claude -p gives up on background subagents 10 minutes after its last
+        # turn, kills them and exits 0: the stage then reads as a success with
+        # its work half-written (#483). The loop lifts that limit unless the
+        # caller set one.
+        result = self.stage("claude")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.calls()[-1]["bg_wait"], "0")
+        result = self.stage("claude", CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="900000")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.calls()[-1]["bg_wait"], "900000")
+
     def test_read_only_adoption(self):
         result = self.stage(TOOLS="Read,Glob,Grep")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -282,6 +298,27 @@ printf '%s' "$RESOURCE_NOTE"
         before = len(self.calls())
         self.stage(FAKE_MODE="timeout", MAX_ATTEMPTS="3")
         self.assertEqual(len(self.calls()), before + 1)
+
+    def test_stop_hint_names_the_file_or_transcript_the_stage_left(self):
+        hint = ('stage test "$PLAN_MODEL" "" /techdebt "$RUN_DIR/impl.json"\n'
+                'stage_record_hint')
+        setup = 'RUN_DIR="$PWD/run"; mkdir -p "$RUN_DIR"; LOG="$RUN_DIR/run.log"\n'
+        # A stage that finished, even unsuccessfully, left its result document.
+        result = self.shell(setup + hint, LOOP_CLI="claude", FAKE_MODE="failed")
+        self.assertIn(f"Read {self.repo}/run/impl.json first.", result.stdout)
+        # A stage killed by the timeout left nothing, so the hint points at the
+        # transcript of the session id the loop chose and passed to claude.
+        result = self.shell(setup + hint, LOOP_CLI="claude", FAKE_MODE="timeout")
+        args = self.calls()[-1]["args"]
+        session = args[args.index("--session-id") + 1]
+        self.assertRegex(session, r"^[0-9a-f-]{36}$")
+        self.assertIn(f"~/.claude/projects/*/{session}.jsonl", result.stdout)
+        self.assertIn(f"claude --resume {session}", result.stdout)
+        # A bail before the stage ran any CLI must not name the previous stage.
+        result = self.shell(setup + hint.replace("stage_record_hint",
+                                                 "mark_stage next; stage_record_hint"),
+                            LOOP_CLI="claude", FAKE_MODE="failed")
+        self.assertIn(f"Read the logs in {self.repo}/run first.", result.stdout)
 
     def test_fast_failure_retries(self):
         result = self.stage(FAKE_MODE="failed", MAX_ATTEMPTS="3")
@@ -379,6 +416,26 @@ commit_leftovers "rejected"
         self.assertIn("could not commit", result.stderr)
         self.assertEqual(self.git("log", "-1", "--format=%s"), "kept")
         self.assertIn("rejected.txt", self.git("status", "--porcelain"))
+
+    def test_commit_leftovers_sets_untracked_logs_aside(self):
+        code = '''
+RUN_DIR="$PWD/run"; mkdir -p "$RUN_DIR"; LOG="$RUN_DIR/run.log"
+echo build > build-cpp.log
+commit_leftovers "only a log" || exit 10
+mkdir -p sub; echo test > sub/test.log; echo kept > kept.txt
+commit_leftovers "kept" || exit 11
+'''
+        (self.repo / ".gitignore").write_text("run/\n")
+        self.git("add", ".gitignore")
+        self.git("commit", "-qm", "ignore run dir")
+        result = self.shell(code)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # A tree holding nothing but a log is clean: no commit is made.
+        self.assertEqual(self.git("log", "--format=%s", "-2").splitlines(), ["kept", "ignore run dir"])
+        self.assertEqual(self.git("show", "--name-only", "--format=", "HEAD"), "kept.txt")
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual((self.repo / "run/stray-logs/build-cpp.log").read_text(), "build\n")
+        self.assertEqual((self.repo / "run/stray-logs/sub/test.log").read_text(), "test\n")
 
     def test_rejected_leftover_commit_stops_the_run(self):
         # Each file is written by a different stage and committed by a different

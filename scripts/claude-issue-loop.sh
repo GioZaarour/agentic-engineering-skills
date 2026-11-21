@@ -428,7 +428,8 @@ bail() {
     if (( USAGE_LIMIT_HIT )); then
       echo "The account spend/usage limit stopped this, not the code. When it resets:"
     else
-      echo "Read $RUN_DIR/$stage_name*.json first — then resume with:"
+      stage_record_hint
+      echo "Then resume with:"
     fi
     echo "  ./scripts/${LOOP_SCRIPT} $ISSUE --from $stage_name"
   } | tee -a "$LOG"

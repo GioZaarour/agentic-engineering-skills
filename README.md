@@ -216,6 +216,7 @@ Everything is an environment variable with a sane default; there is no config fi
 | `BUGFIX_LABELS` / `FEATURE_LABELS` | see script | Regexes over your `gh label list` |
 | `MAX_REVIEW_ROUNDS` | `2` | Review ⇄ fix rounds before it gives up and asks for a human |
 | `STAGE_TIMEOUT` | `14400` | Seconds per stage; a wedge detector, not a pace target |
+| `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` | `0` | How long a claude stage that has ended its turn waits for its background subagents. Claude Code's own default is 10 minutes, after which it kills them and exits 0, so the stage reads as a success with its work half-written. `0` waits with no limit, and `STAGE_TIMEOUT` still applies |
 | `MB_PER_JOB` | `2048` | RAM per build job — raise it for a heavy C++ toolchain, lower it for a light one |
 | `BUILD_JOBS` | measured | Build and test jobs per agent (`-j`). Pins it; the measured value is already divided between loops and between a stage's subagents |
 | `SUBAGENT_CAP_OVERRIDE` | measured | Concurrent subagents a stage may fan out to |

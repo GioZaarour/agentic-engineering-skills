@@ -88,6 +88,13 @@ MUST_IGNORE=("$RUN_ROOT" "scripts/loops-lib.sh")
 # build and test commands from the repo itself.
 LOOP_NOTES="${LOOP_NOTES:-.loop-notes.md}"
 
+# When a `claude -p` stage ends its turn while background subagents are still
+# running, the CLI waits for them and wakes the agent as each one finishes. By
+# default it gives up after 10 minutes, kills them and exits 0, so the stage
+# reads as a success while its work is half-written. 0 removes that limit.
+# STAGE_TIMEOUT below still catches a stage that wedges.
+export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-0}"
+
 # Labels the loop signals through. Both are created if missing (preflight), and
 # `gh --add-label` on a label that does not exist is a silent no-op into the
 # log — exactly the signal you would be looking for.
@@ -107,6 +114,8 @@ FINAL_VERIFY_REVIEW="${FINAL_VERIFY_REVIEW:-0}"
 STAGE_TIMEOUT="${STAGE_TIMEOUT:-14400}"      # 4h/stage. A wedge detector, not a pace target.
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"            # NOT used for timeouts or account limits
 BACKOFF=(0 180 900)                          # seconds before attempt 2 and 3
+LAST_STAGE_OUT=""                            # set by stage(), cleared by mark_stage()
+LAST_STAGE_SESSION=""                        # that stage's CLI session id
 DEADLINE_HOURS="${DEADLINE_HOURS:-168}"      # effectively off; a runaway backstop
 
 # Cost circuit breakers — BOTH OFF (0) by design. If the run is burning plan
@@ -312,6 +321,11 @@ process down mid-edit and the work is lost, not merely slowed.
 
 - **Run at most ${SUBAGENT_CAP} subagent(s) at a time.** If a skill tells you to fan out
   across independent slices or review surfaces, cap the fan-out at ${SUBAGENT_CAP}.
+- **Every subagent must report back before you write your final message.** While
+  they run, do work in this tree that does not depend on them. If there is none,
+  ending your turn to wait is fine: you are woken as each one finishes. A
+  subagent in its own worktree must commit there, and you must bring that
+  commit onto this branch, or its work never reaches the PR.
 - **Creating git worktrees is ${ALLOW_WORKTREES} on this host.** If it is "no", work in the
   current tree, one slice at a time — a second worktree needs its own full set
   of build artifacts and there is not room for one.
@@ -437,6 +451,9 @@ mark_stage() {
     log "   budget: ${LOOPS_SHARING} loop(s) on this host — -j${BUILD_JOBS} per agent, ${SUBAGENT_CAP} subagent(s), worktrees=${ALLOW_WORKTREES}"
   fi
   STATUS_STAGE="$1"; write_status
+  # A bail before this stage runs any CLI must not point at the last stage's
+  # output, so the record stage() keeps is cleared at every stage boundary.
+  LAST_STAGE_OUT=""; LAST_STAGE_SESSION=""
 }
 
 # The exit code is the outcome (see the entrypoint's header); a signal means
@@ -534,16 +551,24 @@ stage() {
       sleep "${BACKOFF[attempt-1]}"
     fi
     log "   ▶ $label ($model${effort:+ $effort})"
+    # bail() reads these to tell the human where this stage's record is.
+    LAST_STAGE_OUT="$out"; LAST_STAGE_SESSION=""
     if [[ "$LOOP_CLI" == codex ]]; then
       run_codex_stage "$model" "$effort" "$prompt" "$out" "$@"
       rc=$?
+      LAST_STAGE_SESSION=$(jq -r '.session_id // empty' "$out" 2>/dev/null)
     else
+      # claude writes its JSON result only on a clean exit, so a stage killed
+      # by the timeout leaves $out empty. Choosing the session id up front is
+      # what keeps the transcript findable in that case.
+      LAST_STAGE_SESSION=$(new_uuid)
       ${runner[@]+"${runner[@]}"} claude -p "$prompt" \
         --model "$model" ${effort:+--effort "$effort"} \
         --permission-mode "$PERMISSION_MODE" \
         --allowedTools "$TOOLS" \
         "${BUDGET_ARGS[@]}" \
         --output-format json \
+        ${LAST_STAGE_SESSION:+--session-id "$LAST_STAGE_SESSION"} \
         "$@" > "$out" 2>>"$LOG"
       rc=$?
     fi
@@ -582,6 +607,34 @@ stage() {
   done
   warn "$label failed after $MAX_ATTEMPTS attempts (exit $rc) — see $out"
   return 1
+}
+
+# Tell the human what to read before resuming a stopped run. Output files are
+# not named after their stages (implement writes impl.json), so this names the
+# file stage() actually wrote. A claude stage killed by the timeout leaves that
+# file empty, and then the only record of what it did is its transcript.
+stage_record_hint() {
+  if [[ -s "$LAST_STAGE_OUT" ]]; then
+    echo "Read $LAST_STAGE_OUT first."
+  elif [[ -n "$LAST_STAGE_SESSION" && "$LOOP_CLI" != codex ]]; then
+    echo "The stage was killed before it wrote ${LAST_STAGE_OUT:-its result}. Read its transcript first:"
+    echo "  ~/.claude/projects/*/$LAST_STAGE_SESSION.jsonl"
+    echo "  (or run 'claude --resume $LAST_STAGE_SESSION' from this worktree)"
+  elif [[ -n "$LAST_STAGE_SESSION" ]]; then
+    echo "The stage left no result. Read its Codex session $LAST_STAGE_SESSION first."
+  else
+    echo "Read the logs in $RUN_DIR first."
+  fi
+}
+
+# A fresh lowercase uuid, or nothing when neither generator exists, in which
+# case stage() lets claude pick the session id itself.
+new_uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr 'A-Z' 'a-z'
+  else
+    python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null
+  fi
 }
 
 slugify() {
@@ -632,12 +685,27 @@ return_to_base() {
   git pull --ff-only          >>"$LOG" 2>&1
 }
 
+# Move untracked *.log files out of the tree and into the run directory before
+# commit_leftovers' `git add -A`. Agents write build and test logs into the
+# worktree, and a stage that times out mid-build leaves one there; committing
+# it puts a thousand lines of compiler output into the PR. The run directory
+# is ignored, so the log is kept as evidence without touching the branch.
+set_aside_stray_logs() {
+  local f n=0 dest="$RUN_DIR/stray-logs"
+  while IFS= read -r -d '' f; do
+    mkdir -p "$dest/$(dirname "$f")" && mv -f -- "$f" "$dest/$f" && n=$((n + 1))
+  done < <(git ls-files -z --others --exclude-standard -- '*.log')
+  (( n )) && log "   moved $n untracked log file(s) to $dest instead of committing them"
+  return 0
+}
+
 # Capture anything a skill left uncommitted, so it cannot ride onto the next
 # branch. Returns 0 when there was nothing to commit or the commit landed, and 1
 # when git refused it — a pre-commit hook, a missing identity, a full disk. The
 # caller must stop on 1: the stage's edits then exist only in this worktree, and
 # pushing HEAD would publish the branch without them.
 commit_leftovers() {
+  set_aside_stray_logs
   [[ -n "$(git status --porcelain)" ]] || return 0
   if git add -A >>"$LOG" 2>&1 && git commit -qm "$1" >>"$LOG" 2>&1; then
     log "   captured uncommitted leftovers"
