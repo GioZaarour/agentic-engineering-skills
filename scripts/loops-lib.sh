@@ -88,6 +88,13 @@ MUST_IGNORE=("$RUN_ROOT" "scripts/loops-lib.sh")
 # build and test commands from the repo itself.
 LOOP_NOTES="${LOOP_NOTES:-.loop-notes.md}"
 
+# When a `claude -p` stage ends its turn while background subagents are still
+# running, the CLI waits for them and wakes the agent as each one finishes. By
+# default it gives up after 10 minutes, kills them and exits 0, so the stage
+# reads as a success while its work is half-written. 0 removes that limit.
+# STAGE_TIMEOUT below still catches a stage that wedges.
+export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-0}"
+
 # Labels the loop signals through. Both are created if missing (preflight), and
 # `gh --add-label` on a label that does not exist is a silent no-op into the
 # log — exactly the signal you would be looking for.
@@ -314,6 +321,11 @@ process down mid-edit and the work is lost, not merely slowed.
 
 - **Run at most ${SUBAGENT_CAP} subagent(s) at a time.** If a skill tells you to fan out
   across independent slices or review surfaces, cap the fan-out at ${SUBAGENT_CAP}.
+- **Every subagent must report back before you write your final message.** While
+  they run, do work in this tree that does not depend on them. If there is none,
+  ending your turn to wait is fine: you are woken as each one finishes. A
+  subagent in its own worktree must commit there, and you must bring that
+  commit onto this branch, or its work never reaches the PR.
 - **Creating git worktrees is ${ALLOW_WORKTREES} on this host.** If it is "no", work in the
   current tree, one slice at a time — a second worktree needs its own full set
   of build artifacts and there is not room for one.

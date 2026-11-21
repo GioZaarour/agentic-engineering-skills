@@ -21,7 +21,8 @@ if args == ['auth', 'status']:
     sys.exit(0)
 prompt = sys.stdin.read() if cli == 'codex' else args[args.index('-p') + 1]
 with open(os.environ['CALLS'], 'a') as f:
-    f.write(json.dumps(dict(cli=cli, args=args, prompt=prompt)) + '\n')
+    f.write(json.dumps(dict(cli=cli, args=args, prompt=prompt,
+                            bg_wait=os.environ.get('CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS'))) + '\n')
 mode = os.environ.get('FAKE_MODE', 'success')
 result = 'OK'
 if 'ADOPT_BRANCH:' in prompt:
@@ -124,7 +125,8 @@ class IssueLoopTests(unittest.TestCase):
                     "STAGE_BUDGET_USD", "TOTAL_BUDGET_USD", "FAKE_MODE", "LOOPS_SHARE",
                     "BUILD_JOBS", "SUBAGENT_CAP_OVERRIDE", "ALLOW_WORKTREES_OVERRIDE", "MB_PER_JOB",
                     "LOOPS_MEMORY_MAX", "LOOPS_MEMORY_RESERVE_MB", "LOOPS_SLICE",
-                    "LOOPS_WORKTREE_PARENT", "LOOPS_WORKTREE_ROOT"):
+                    "LOOPS_WORKTREE_PARENT", "LOOPS_WORKTREE_ROOT",
+                    "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"):
             self.env.pop(key, None)
         self.git("init", "-q", "-b", "main")
         self.git("config", "user.name", "Loop Test")
@@ -256,6 +258,18 @@ printf '%s' "$RESOURCE_NOTE"
                 else:
                     self.assertIn("--effort", call["args"])
                     self.assertTrue(call["prompt"].startswith("/branch-review"))
+
+    def test_claude_stage_waits_for_background_subagents_without_a_limit(self):
+        # claude -p gives up on background subagents 10 minutes after its last
+        # turn, kills them and exits 0: the stage then reads as a success with
+        # its work half-written (#483). The loop lifts that limit unless the
+        # caller set one.
+        result = self.stage("claude")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.calls()[-1]["bg_wait"], "0")
+        result = self.stage("claude", CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="900000")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.calls()[-1]["bg_wait"], "900000")
 
     def test_read_only_adoption(self):
         result = self.stage(TOOLS="Read,Glob,Grep")
